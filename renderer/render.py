@@ -406,16 +406,21 @@ def _usage_metrics(status):
     if tool == "Codex":
         limit = status.get("usage_percent")
         resets = _format_resets(status.get("usage_resets_at"))
-        first_row = ("bar", "RATE LIMIT", limit, resets or ("no usage data" if limit is None else ""), "usage_percent", status.get("usage_resets_at"))
+        rows = [("bar", "RATE LIMIT", limit, resets or ("no usage data" if limit is None else ""), "usage_percent", status.get("usage_resets_at"))]
         ctx = status.get("context_percent")
+        secondary = status.get("secondary_percent")
         if ctx is not None:
-            second_row = ("bar", "CONTEXT", ctx, "", "context_percent", None)
-        else:
-            secondary = status.get("secondary_percent")
+            rows.append(("bar", "CONTEXT", ctx, "", "context_percent", None))
+        elif secondary is not None:
+            # Some plans' live usage API never returns a secondary_window at
+            # all (primary_window IS the account's only limit, sometimes
+            # already a weekly-length one) — that's a permanent "no data" for
+            # this account, not a transient gap, so the row is dropped
+            # entirely rather than shown pinned to "no usage data" forever.
             sec_resets = _format_resets(status.get("secondary_resets_at"))
-            second_row = ("bar", "WEEKLY", secondary, sec_resets or ("no usage data" if secondary is None else ""), "secondary_percent", status.get("secondary_resets_at"))
-        third_row = ("bar", "CACHE HIT", status.get("cache_hit_percent"), "", "cache_hit_percent", None)
-        return [first_row, second_row, third_row]
+            rows.append(("bar", "WEEKLY", secondary, sec_resets or "", "secondary_percent", status.get("secondary_resets_at")))
+        rows.append(("bar", "CACHE HIT", status.get("cache_hit_percent"), "", "cache_hit_percent", None))
+        return rows
     tok, req = status.get("zcode_token_percent"), status.get("zcode_request_percent")
     tok_resets = _format_resets(status.get("zcode_token_resets_at"))
     req_left, req_total = status.get("zcode_request_remaining"), status.get("zcode_request_total")
