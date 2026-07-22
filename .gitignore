@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.pyc
+frame.png
+preview*.png
+pushloop.log
+usage_history.sqlite3
+pricing_cache.json
+state.json
