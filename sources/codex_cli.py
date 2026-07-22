@@ -112,7 +112,11 @@ def _parse_session(path, mtime):
                 info = payload.get("info")
                 if info:
                     window = info.get("model_context_window")
-                    total = (info.get("total_token_usage") or {}).get("total_tokens")
+                    # total_token_usage is cumulative for the whole session (grows every
+                    # turn, blows past the window almost immediately on a long session);
+                    # last_token_usage is this turn's actual request size, i.e. the real
+                    # current context-window fill.
+                    total = (info.get("last_token_usage") or {}).get("total_tokens")
                     if window and total is not None:
                         context_percent = min(100.0, total / window * 100)
         elif etype == "response_item":
