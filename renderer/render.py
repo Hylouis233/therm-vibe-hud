@@ -389,11 +389,11 @@ def _usage_metrics(status):
     tool = status["tool"]
     if tool == "Claude Code":
         five, seven = status.get("usage_percent"), status.get("usage_seven_day_percent")
+        hit = status.get("cache_hit_percent")
         if five is None and seven is None:
             # No Anthropic quota API reachable (e.g. a custom ANTHROPIC_BASE_URL) —
             # fall back to real, locally-derived context stats instead of a dead bar.
             ctx_tok = status.get("context_tokens")
-            hit = status.get("cache_hit_percent")
             return [
                 ("stat", "CONTEXT", _human_count(ctx_tok) + " tok" if ctx_tok else "—", "", None, None),
                 ("bar", "CACHE HIT", hit, "", "cache_hit_percent", None),
@@ -402,6 +402,7 @@ def _usage_metrics(status):
         return [
             ("bar", "5-HOUR", five, resets or ("no usage data" if five is None else ""), "usage_percent", status.get("usage_resets_at")),
             ("bar", "7-DAY", seven, "", "usage_seven_day_percent", None),
+            ("bar", "CACHE HIT", hit, "", "cache_hit_percent", None),
         ]
     if tool == "Codex":
         limit = status.get("usage_percent")
