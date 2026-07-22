@@ -352,8 +352,9 @@ def _fetch_live_quota():
 
 
 def _scan_rollouts_for_last_known(scan_model_only=False):
-    """Fallback source, and the only source for last-used model identity
-    (the live usage endpoint doesn't report which model you were running)."""
+    """Fallback source, and the only source for last-used model identity and
+    cache-hit % — neither the live usage endpoint nor an idle session (with
+    no recent token_count event of its own) exposes them."""
     files = glob.glob(str(SESSIONS_DIR / "**" / "rollout-*.jsonl"), recursive=True)
     candidates = []
     for f in files:
@@ -364,18 +365,19 @@ def _scan_rollouts_for_last_known(scan_model_only=False):
         candidates.append((f, mtime))
     candidates.sort(key=lambda x: -x[1])
 
-    # model and usage_percent are tracked independently across the scan (first
-    # i.e. most-recent hit for each, since candidates are sorted newest-first)
-    # — a usage_percent rejected for being past ROLLOUT_QUOTA_STALE_SEC must
-    # not also discard a perfectly good model identity from that same file.
+    # model, usage_percent, and cache_hit_percent are tracked independently
+    # across the scan (first i.e. most-recent hit for each, since candidates
+    # are sorted newest-first) — a value rejected for being past
+    # ROLLOUT_QUOTA_STALE_SEC must not also discard a perfectly good model
+    # identity (or a perfectly good OTHER value) from that same file.
     now = time.time()
-    model = usage_percent = usage_resets_at = None
+    model = usage_percent = usage_resets_at = cache_hit_percent = None
     for f, mtime in candidates[:LAST_KNOWN_QUOTA_SCAN_FILES]:
         try:
             lines = _tail_bytes(f, LIFETIME_TAIL_BYTES)
         except OSError:
             continue
-        file_model = file_usage_percent = file_usage_resets_at = None
+        file_model = file_usage_percent = file_usage_resets_at = file_cache_hit_percent = None
         for line in lines:
             try:
                 obj = json.loads(line)
@@ -386,27 +388,40 @@ def _scan_rollouts_for_last_known(scan_model_only=False):
                 continue
             if obj.get("type") == "turn_context" and payload.get("model"):
                 file_model = payload["model"]
-            elif not scan_model_only and obj.get("type") == "event_msg" and payload.get("type") == "token_count":
-                primary = (payload.get("rate_limits") or {}).get("primary")
-                if primary:
-                    file_usage_percent = primary.get("used_percent")
-                    file_usage_resets_at = primary.get("resets_at")
+            elif obj.get("type") == "event_msg" and payload.get("type") == "token_count":
+                if not scan_model_only:
+                    primary = (payload.get("rate_limits") or {}).get("primary")
+                    if primary:
+                        file_usage_percent = primary.get("used_percent")
+                        file_usage_resets_at = primary.get("resets_at")
+                # Cache-hit % is never live-fetched (unlike usage_percent, it
+                # has no account-wide API source at all) so this scan is its
+                # ONLY fallback tier — always attempted, even when
+                # scan_model_only skips the usage_percent extraction above.
+                last = (payload.get("info") or {}).get("last_token_usage") or {}
+                input_t = last.get("input_tokens")
+                if input_t:
+                    file_cache_hit_percent = (last.get("cached_input_tokens") or 0) / input_t * 100
 
         if model is None and file_model:
             model = file_model
         if (usage_percent is None and file_usage_percent is not None
                 and now - mtime <= ROLLOUT_QUOTA_STALE_SEC):
             usage_percent, usage_resets_at = file_usage_percent, file_usage_resets_at
+        if (cache_hit_percent is None and file_cache_hit_percent is not None
+                and now - mtime <= ROLLOUT_QUOTA_STALE_SEC):
+            cache_hit_percent = file_cache_hit_percent
 
-        if model and (scan_model_only or usage_percent is not None):
+        if model and cache_hit_percent is not None and (scan_model_only or usage_percent is not None):
             break
 
-    return usage_percent, usage_resets_at, model
+    return usage_percent, usage_resets_at, model, cache_hit_percent
 
 
 _EMPTY_QUOTA = {
     "usage_percent": None, "usage_resets_at": None, "model": None, "plan_type": None,
     "secondary_percent": None, "secondary_resets_at": None, "credits_balance": None, "credits_unlimited": False,
+    "cache_hit_percent": None,
 }
 
 
@@ -435,10 +450,11 @@ def _compute_last_known_quota():
         print("[codex_cli] live quota fetch failed with no recent cached value "
               "— falling back to rollout-file scan", file=sys.stderr)
 
-    _fallback_percent, fallback_resets_at, model = _scan_rollouts_for_last_known(scan_model_only=live is not None)
+    _fallback_percent, fallback_resets_at, model, fallback_cache_hit = _scan_rollouts_for_last_known(scan_model_only=live is not None)
     if live is not None:
-        return {**_EMPTY_QUOTA, **live, "model": model}
-    return {**_EMPTY_QUOTA, "usage_percent": _fallback_percent, "usage_resets_at": fallback_resets_at, "model": model}
+        return {**_EMPTY_QUOTA, **live, "model": model, "cache_hit_percent": fallback_cache_hit}
+    return {**_EMPTY_QUOTA, "usage_percent": _fallback_percent, "usage_resets_at": fallback_resets_at,
+            "model": model, "cache_hit_percent": fallback_cache_hit}
 
 
 _quota_cache = BackgroundCache(_compute_last_known_quota, LAST_KNOWN_QUOTA_TTL_SEC)
@@ -452,8 +468,8 @@ def read_status():
     files = _recent_rollouts()
     lifetime_total_tokens, lifetime_session_count, lifetime_cost_usd = _lifetime_stats()
     quota = _last_known_quota()
-    last_usage_percent, last_usage_resets_at, last_model = (
-        quota["usage_percent"], quota["usage_resets_at"], quota["model"]
+    last_usage_percent, last_usage_resets_at, last_model, last_cache_hit_percent = (
+        quota["usage_percent"], quota["usage_resets_at"], quota["model"], quota["cache_hit_percent"]
     )
     base = {
         "tool": "Codex",
@@ -469,7 +485,7 @@ def read_status():
     if not files:
         return {**base, "state": "no session", "sessions": [], "active_count": 0,
                 "usage_percent": last_usage_percent, "usage_resets_at": last_usage_resets_at,
-                "context_percent": None, "cache_hit_percent": None, "identity": last_model}
+                "context_percent": None, "cache_hit_percent": last_cache_hit_percent, "identity": last_model}
 
     sessions = []
     for f, mtime in files:
@@ -489,6 +505,8 @@ def read_status():
 
     if usage_percent is None:
         usage_percent, usage_resets_at = last_usage_percent, last_usage_resets_at
+    if cache_hit_percent is None:
+        cache_hit_percent = last_cache_hit_percent
 
     identity = next((s["model"] for s in sorted(sessions, key=lambda s: -s["updated_at"]) if s.get("model")), None)
     if identity is None:
