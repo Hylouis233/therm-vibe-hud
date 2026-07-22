@@ -290,10 +290,12 @@ def _bar_metric_row(draw, x0, x1, y, label, pct, caption, trend=None, warn=None,
 
     if pct is None:
         # No dead 0%-dash bar — a single dim line reads as "unmeasured", not "empty".
+        # Offset must clear the label's own line box (font14 ascent+descent=17px)
+        # or the note text's ascender row collides with the label's descender row.
         note = caption or "no data"
         nf = _mono_font(13)
         nw = draw.textlength(note, font=nf)
-        draw.text((x1 - nw, y + (18 if compact else 24)), note, font=nf, fill=FG_FAINT)
+        draw.text((x1 - nw, y + (20 if compact else 24)), note, font=nf, fill=FG_FAINT)
         return
 
     pct_text = f"{pct:.0f}%"
@@ -308,7 +310,13 @@ def _bar_metric_row(draw, x0, x1, y, label, pct, caption, trend=None, warn=None,
 
     caption_text = f"⚠ pace → {warn:.0f}% by reset" if warn else caption
     spark_x1 = x1
-    cap_gap = 9 if compact else 15
+    # cap_gap is measured from bar_y, not from the bar's bottom edge (bar_y +
+    # thickness=8) — must clear that plus the font's own ascent (11px at size
+    # 11) or the caption's ink sits on top of the bar fill. 12 leaves a real
+    # 4px gap after the bar; the previous value of 9 left only 1px and was
+    # visibly overlapping the bar on any row with a caption (e.g. the pace
+    # warning), independent of caption content.
+    cap_gap = 12 if compact else 15
     cap_size = 11 if compact else 12
     if caption_text:
         cf = _mono_font(cap_size)
@@ -317,10 +325,15 @@ def _bar_metric_row(draw, x0, x1, y, label, pct, caption, trend=None, warn=None,
         spark_x1 = x1 - cw - 14
 
     # Sparkline fills whatever horizontal space the caption doesn't use —
-    # no dedicated row, so it never costs the panel extra height.
+    # no dedicated row, so it never costs the panel extra height. Deliberately
+    # NOT `color`: when warn overrides the bar+caption to BAD, a same-color
+    # sparkline sitting a few px below reads as a smear of the bar rather than
+    # a separate element — its own severity color keeps the row legible even
+    # with the tight compact-mode gap.
     if trend:
-        spark_top, spark_bot = (7, 20) if compact else (13, 27)
-        _sparkline(draw, x0, bar_y + spark_top, spark_x1, bar_y + spark_bot, trend, color)
+        spark_top, spark_bot = (12, 26) if compact else (13, 27)
+        spark_color = _severity_color(pct, invert=invert)
+        _sparkline(draw, x0, bar_y + spark_top, spark_x1, bar_y + spark_bot, trend, spark_color)
 
 
 def _stat_metric_row(draw, x0, x1, y, label, value_text, caption):
@@ -483,19 +496,20 @@ def _draw_agent_panel(img, x0, status, bg=None, bg_name=None):
             draw.text((ix0, y + 2), f"+{remaining} more", font=_mono_font(13), fill=FG_FAINT)
         y += row_h * slots_left
 
-    y += 8
+    metrics = _usage_metrics(status)
+    # 3 rows (panels with a CACHE HIT bar added) need tighter spacing to still
+    # fit above the footer line within the fixed card height — 2-row panels
+    # keep the original roomier layout untouched. Decided before the sessions
+    # divider so the reclaimed gap below can feed the USAGE rows their room.
+    compact = len(metrics) > 2
+    row_step = 47 if compact else 58
+
+    y += 0 if compact else 8
     _hairline(draw, ix0, ix1, y)
     y += 20
 
     draw.text((ix0, y), "USAGE", font=_mono_font(12), fill=FG_FAINT)
     y += 22
-
-    metrics = _usage_metrics(status)
-    # 3 rows (panels with a CACHE HIT bar added) need tighter spacing to still
-    # fit above the footer line within the fixed card height — 2-row panels
-    # keep the original roomier layout untouched.
-    compact = len(metrics) > 2
-    row_step = 44 if compact else 58
     for kind, label, value, caption, metric_key, resets_at in metrics:
         if kind == "bar":
             trend = history.recent_values(status["tool"], metric_key) if metric_key else None

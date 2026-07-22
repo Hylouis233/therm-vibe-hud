@@ -233,6 +233,18 @@ def _lifetime_stats():
 
 LAST_KNOWN_QUOTA_SCAN_FILES = 20
 LAST_KNOWN_QUOTA_TTL_SEC = 60
+# A brief live-fetch hiccup (network blip, timeout, transient 5xx) shouldn't
+# yank the displayed % back to a rollout-file snapshot that could be far
+# staler than the outage itself — bridge short gaps with the last value that
+# really did come from the live account-wide endpoint.
+LAST_LIVE_QUOTA_MAX_AGE_SEC = 15 * 60
+# The rate_limits.primary.used_percent embedded in an old rollout file's last
+# token_count event is a point-in-time snapshot, not a live read. Past this
+# age, usage has almost certainly moved on enough that presenting it as
+# current would actively mislead rather than help — the fallback scan stops
+# trusting it as a usage_percent source (though it still trusts old files for
+# last-used *model*, which doesn't go stale the same way).
+ROLLOUT_QUOTA_STALE_SEC = 3 * 3600
 
 
 def _load_auth_tokens():
@@ -297,20 +309,27 @@ def _fetch_live_quota():
             if exc.code in (401, 403) and refresh_token and attempt == 0:
                 try:
                     new_token = _refresh_access_token(refresh_token)
-                except (urllib.error.URLError, OSError, ValueError):
+                except (urllib.error.URLError, OSError, ValueError) as refresh_exc:
+                    print(f"[codex_cli] token refresh failed: {refresh_exc}", file=sys.stderr)
                     return None
                 if not new_token:
+                    print("[codex_cli] token refresh returned no access_token", file=sys.stderr)
                     return None
                 access_token = new_token
                 continue
+            # Failure reason only — never log headers/tokens/account_id, which
+            # could carry the account email downstream.
+            print(f"[codex_cli] live quota fetch failed: HTTP {exc.code}", file=sys.stderr)
             return None
-        except (urllib.error.URLError, OSError, ValueError):
+        except (urllib.error.URLError, OSError, ValueError) as exc:
+            print(f"[codex_cli] live quota fetch failed: {exc}", file=sys.stderr)
             return None
 
         rate_limit = payload.get("rate_limit") or {}
         primary = rate_limit.get("primary_window") or {}
         used_percent = primary.get("used_percent")
         if used_percent is None:
+            print("[codex_cli] live quota response missing primary_window.used_percent", file=sys.stderr)
             return None
         secondary = rate_limit.get("secondary_window") or {}
         credits = payload.get("credits") or {}
@@ -345,12 +364,18 @@ def _scan_rollouts_for_last_known(scan_model_only=False):
         candidates.append((f, mtime))
     candidates.sort(key=lambda x: -x[1])
 
-    for f, _mtime in candidates[:LAST_KNOWN_QUOTA_SCAN_FILES]:
+    # model and usage_percent are tracked independently across the scan (first
+    # i.e. most-recent hit for each, since candidates are sorted newest-first)
+    # — a usage_percent rejected for being past ROLLOUT_QUOTA_STALE_SEC must
+    # not also discard a perfectly good model identity from that same file.
+    now = time.time()
+    model = usage_percent = usage_resets_at = None
+    for f, mtime in candidates[:LAST_KNOWN_QUOTA_SCAN_FILES]:
         try:
             lines = _tail_bytes(f, LIFETIME_TAIL_BYTES)
         except OSError:
             continue
-        usage_percent = usage_resets_at = model = None
+        file_model = file_usage_percent = file_usage_resets_at = None
         for line in lines:
             try:
                 obj = json.loads(line)
@@ -360,22 +385,32 @@ def _scan_rollouts_for_last_known(scan_model_only=False):
             if not isinstance(payload, dict):
                 continue
             if obj.get("type") == "turn_context" and payload.get("model"):
-                model = payload["model"]
+                file_model = payload["model"]
             elif not scan_model_only and obj.get("type") == "event_msg" and payload.get("type") == "token_count":
                 primary = (payload.get("rate_limits") or {}).get("primary")
                 if primary:
-                    usage_percent = primary.get("used_percent")
-                    usage_resets_at = primary.get("resets_at")
-        if model and (scan_model_only or usage_percent is not None):
-            return usage_percent, usage_resets_at, model
+                    file_usage_percent = primary.get("used_percent")
+                    file_usage_resets_at = primary.get("resets_at")
 
-    return None, None, None
+        if model is None and file_model:
+            model = file_model
+        if (usage_percent is None and file_usage_percent is not None
+                and now - mtime <= ROLLOUT_QUOTA_STALE_SEC):
+            usage_percent, usage_resets_at = file_usage_percent, file_usage_resets_at
+
+        if model and (scan_model_only or usage_percent is not None):
+            break
+
+    return usage_percent, usage_resets_at, model
 
 
 _EMPTY_QUOTA = {
     "usage_percent": None, "usage_resets_at": None, "model": None, "plan_type": None,
     "secondary_percent": None, "secondary_resets_at": None, "credits_balance": None, "credits_unlimited": False,
 }
+
+
+_last_live_quota = None  # (quota_dict, fetched_at) from the most recent successful live fetch
 
 
 def _compute_last_known_quota():
@@ -386,7 +421,20 @@ def _compute_last_known_quota():
     current value, plus plan/secondary-window/credits that only the live API
     exposes), falling back to the last rollout snapshot only if the live call
     can't be made (offline, no stored auth, etc.)."""
+    global _last_live_quota
     live = _fetch_live_quota()
+    now = time.time()
+    if live is not None:
+        _last_live_quota = (live, now)
+    elif _last_live_quota is not None and now - _last_live_quota[1] <= LAST_LIVE_QUOTA_MAX_AGE_SEC:
+        # This cycle's live call failed, but we had a good one recently enough
+        # to trust — reuse it rather than jumping to a rollout-file snapshot
+        # that's very likely staler than this brief outage.
+        live = _last_live_quota[0]
+    else:
+        print("[codex_cli] live quota fetch failed with no recent cached value "
+              "— falling back to rollout-file scan", file=sys.stderr)
+
     _fallback_percent, fallback_resets_at, model = _scan_rollouts_for_last_known(scan_model_only=live is not None)
     if live is not None:
         return {**_EMPTY_QUOTA, **live, "model": model}
