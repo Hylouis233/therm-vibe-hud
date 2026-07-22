@@ -311,12 +311,13 @@ def _bar_metric_row(draw, x0, x1, y, label, pct, caption, trend=None, warn=None,
     caption_text = f"⚠ pace → {warn:.0f}% by reset" if warn else caption
     spark_x1 = x1
     # cap_gap is measured from bar_y, not from the bar's bottom edge (bar_y +
-    # thickness=8) — must clear that plus the font's own ascent (11px at size
-    # 11) or the caption's ink sits on top of the bar fill. 12 leaves a real
-    # 4px gap after the bar; the previous value of 9 left only 1px and was
-    # visibly overlapping the bar on any row with a caption (e.g. the pace
-    # warning), independent of caption content.
-    cap_gap = 12 if compact else 15
+    # thickness=8) — must clear that plus the font's own ink offset (glyphs
+    # render a couple px below the y coordinate passed to draw.text) or the
+    # caption's ink sits on top of the bar fill. Pixel-scanned across every
+    # caption string this row can show (plain "resets in…", the pace-warning
+    # text, etc.) — 17/18 is the smallest value that still clears a real 10px
+    # gap in the worst case; smaller values were verified to leave <10px.
+    cap_gap = 17 if compact else 18
     cap_size = 11 if compact else 12
     if caption_text:
         cf = _mono_font(cap_size)
@@ -331,7 +332,13 @@ def _bar_metric_row(draw, x0, x1, y, label, pct, caption, trend=None, warn=None,
     # a separate element — its own severity color keeps the row legible even
     # with the tight compact-mode gap.
     if trend:
-        spark_top, spark_bot = (12, 26) if compact else (13, 27)
+        # A curve can touch its own top bound at any data point (unlike text,
+        # which has a roughly fixed ink offset), so this needed its own
+        # pixel-scan across volatile trend shapes: 19 is the smallest value
+        # that still guarantees a real 10px gap after the bar in the worst
+        # case. Same value in both modes — the sparkline's own geometry
+        # doesn't depend on compact, only bar_y (handled separately) does.
+        spark_top, spark_bot = 19, 33
         spark_color = _severity_color(pct, invert=invert)
         _sparkline(draw, x0, bar_y + spark_top, spark_x1, bar_y + spark_bot, trend, spark_color)
 
@@ -480,8 +487,18 @@ def _draw_agent_panel(img, x0, status, bg=None, bg_name=None):
     draw.text((ix0, y), "SESSIONS", font=_mono_font(12), fill=FG_FAINT)
     y += 22
 
+    # 3 rows (panels with a CACHE HIT bar added) need a real 10px gap after
+    # each bar, which in turn needs more room per row than 2-row panels —
+    # computed here (rather than after the sessions block) so the session
+    # rows and the SESSIONS->USAGE transition can also give up some of their
+    # own space to it, instead of squeezing everything into the leftover
+    # room at the bottom of the card.
+    metrics = _usage_metrics(status)
+    compact = len(metrics) > 2
+    row_step = 54 if compact else 58
+
     sessions = status.get("sessions", [])
-    row_h = 30
+    row_h = 27 if compact else 30
     if not sessions:
         draw.text((ix0, y + 4), "No active session", font=_title_font(16), fill=FG_FAINT)
         y += row_h * MAX_SESSION_ROWS
@@ -496,20 +513,12 @@ def _draw_agent_panel(img, x0, status, bg=None, bg_name=None):
             draw.text((ix0, y + 2), f"+{remaining} more", font=_mono_font(13), fill=FG_FAINT)
         y += row_h * slots_left
 
-    metrics = _usage_metrics(status)
-    # 3 rows (panels with a CACHE HIT bar added) need tighter spacing to still
-    # fit above the footer line within the fixed card height — 2-row panels
-    # keep the original roomier layout untouched. Decided before the sessions
-    # divider so the reclaimed gap below can feed the USAGE rows their room.
-    compact = len(metrics) > 2
-    row_step = 47 if compact else 58
-
     y += 0 if compact else 8
     _hairline(draw, ix0, ix1, y)
-    y += 20
+    y += 14 if compact else 20
 
     draw.text((ix0, y), "USAGE", font=_mono_font(12), fill=FG_FAINT)
-    y += 22
+    y += 16 if compact else 22
     for kind, label, value, caption, metric_key, resets_at in metrics:
         if kind == "bar":
             trend = history.recent_values(status["tool"], metric_key) if metric_key else None
