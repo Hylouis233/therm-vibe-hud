@@ -79,7 +79,7 @@ def read_status():
     base = {"tool": "zcode", "identity": entitlement.get("zcode_plan"), **entitlement}
     if not DB_PATH.exists():
         return {**base, "state": "no session", "sessions": [], "active_count": 0,
-                "session_tokens": None, "sessions_today": 0}
+                "session_tokens": None, "sessions_today": 0, "cache_hit_percent": None}
 
     now = time.time()
     con = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True, timeout=2)
@@ -95,20 +95,27 @@ def read_status():
 
         sessions = []
         latest_tokens = None
+        latest_cache_hit_percent = None
         for session_id, title, time_updated_ms, directory in rows:
             mtime = (time_updated_ms or 0) / 1000
             age = now - mtime
 
             cur.execute(
-                "SELECT json_extract(data,'$.role'), json_extract(data,'$.tokens.total') "
+                "SELECT json_extract(data,'$.role'), json_extract(data,'$.tokens.total'), "
+                "json_extract(data,'$.tokens.input'), json_extract(data,'$.tokens.cache.read') "
                 "FROM message WHERE session_id=? ORDER BY id DESC LIMIT 1",
                 (session_id,),
             )
             last_row = cur.fetchone()
             last_role = last_row[0] if last_row else None
             session_tokens = last_row[1] if last_row else None
+            session_input, session_cache_read = (last_row[2], last_row[3]) if last_row else (None, None)
             if latest_tokens is None and session_tokens is not None:
                 latest_tokens = session_tokens
+                # cache.read is a subset of input (same OpenAI-style reporting as
+                # Codex), so this is directly "share of input served from cache".
+                if session_input:
+                    latest_cache_hit_percent = (session_cache_read or 0) / session_input * 100
 
             if age > IDLE_THRESHOLD_SEC:
                 state, detail = "idle", "waiting for input"
@@ -132,7 +139,8 @@ def read_status():
 
     if not sessions:
         return {**base, "state": "no session", "sessions": [], "active_count": 0,
-                "session_tokens": None, "sessions_today": sessions_today}
+                "session_tokens": None, "sessions_today": sessions_today,
+                "cache_hit_percent": None}
 
     sessions.sort(key=lambda s: (-STATE_PRIORITY.get(s["state"], 0), -s["updated_at"]))
     active_count = sum(1 for s in sessions if s["state"] in ("running", "thinking"))
@@ -145,6 +153,7 @@ def read_status():
         "active_count": active_count,
         "session_tokens": latest_tokens,
         "sessions_today": sessions_today,
+        "cache_hit_percent": latest_cache_hit_percent,
     }
 
 

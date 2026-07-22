@@ -284,7 +284,7 @@ def _sparkline(draw, x0, y0, x1, y1, values, color):
     draw.line(pts, fill=color, width=2, joint="curve")
 
 
-def _bar_metric_row(draw, x0, x1, y, label, pct, caption, trend=None, warn=None, invert=False):
+def _bar_metric_row(draw, x0, x1, y, label, pct, caption, trend=None, warn=None, invert=False, compact=False):
     lf = _mono_font(14)
     draw.text((x0, y), label, font=lf, fill=FG_DIM)
 
@@ -293,7 +293,7 @@ def _bar_metric_row(draw, x0, x1, y, label, pct, caption, trend=None, warn=None,
         note = caption or "no data"
         nf = _mono_font(13)
         nw = draw.textlength(note, font=nf)
-        draw.text((x1 - nw, y + 24), note, font=nf, fill=FG_FAINT)
+        draw.text((x1 - nw, y + (18 if compact else 24)), note, font=nf, fill=FG_FAINT)
         return
 
     pct_text = f"{pct:.0f}%"
@@ -301,21 +301,26 @@ def _bar_metric_row(draw, x0, x1, y, label, pct, caption, trend=None, warn=None,
     pw = draw.textlength(pct_text, font=lf)
     draw.text((x1 - pw, y), pct_text, font=lf, fill=color)
 
-    bar_y = y + 22
+    # compact=True packs 3 rows into the space 2 normally use (panels that gained
+    # a CACHE HIT row) — same bar thickness for visual consistency, tighter gaps.
+    bar_y = y + (18 if compact else 22)
     _capsule_bar(draw, x0, bar_y, x1, 8, pct, color)
 
     caption_text = f"⚠ pace → {warn:.0f}% by reset" if warn else caption
     spark_x1 = x1
+    cap_gap = 9 if compact else 15
+    cap_size = 11 if compact else 12
     if caption_text:
-        cf = _mono_font(12)
+        cf = _mono_font(cap_size)
         cw = draw.textlength(caption_text, font=cf)
-        draw.text((x1 - cw, bar_y + 15), caption_text, font=cf, fill=BAD if warn else FG_FAINT)
+        draw.text((x1 - cw, bar_y + cap_gap), caption_text, font=cf, fill=BAD if warn else FG_FAINT)
         spark_x1 = x1 - cw - 14
 
     # Sparkline fills whatever horizontal space the caption doesn't use —
     # no dedicated row, so it never costs the panel extra height.
     if trend:
-        _sparkline(draw, x0, bar_y + 13, spark_x1, bar_y + 27, trend, color)
+        spark_top, spark_bot = (7, 20) if compact else (13, 27)
+        _sparkline(draw, x0, bar_y + spark_top, spark_x1, bar_y + spark_bot, trend, color)
 
 
 def _stat_metric_row(draw, x0, x1, y, label, value_text, caption):
@@ -389,7 +394,8 @@ def _usage_metrics(status):
             secondary = status.get("secondary_percent")
             sec_resets = _format_resets(status.get("secondary_resets_at"))
             second_row = ("bar", "WEEKLY", secondary, sec_resets or ("no usage data" if secondary is None else ""), "secondary_percent", status.get("secondary_resets_at"))
-        return [first_row, second_row]
+        third_row = ("bar", "CACHE HIT", status.get("cache_hit_percent"), "", "cache_hit_percent", None)
+        return [first_row, second_row, third_row]
     tok, req = status.get("zcode_token_percent"), status.get("zcode_request_percent")
     tok_resets = _format_resets(status.get("zcode_token_resets_at"))
     req_left, req_total = status.get("zcode_request_remaining"), status.get("zcode_request_total")
@@ -400,6 +406,7 @@ def _usage_metrics(status):
     return [
         ("bar", "TOKENS", tok, tok_resets or ("no usage data" if tok is None else ""), "zcode_token_percent", status.get("zcode_token_resets_at")),
         ("bar", "REQUESTS", req, req_caption or "", "zcode_request_percent", status.get("zcode_request_resets_at")),
+        ("bar", "CACHE HIT", status.get("cache_hit_percent"), "", "cache_hit_percent", None),
     ]
 
 
@@ -483,15 +490,21 @@ def _draw_agent_panel(img, x0, status, bg=None, bg_name=None):
     draw.text((ix0, y), "USAGE", font=_mono_font(12), fill=FG_FAINT)
     y += 22
 
-    for kind, label, value, caption, metric_key, resets_at in _usage_metrics(status):
+    metrics = _usage_metrics(status)
+    # 3 rows (panels with a CACHE HIT bar added) need tighter spacing to still
+    # fit above the footer line within the fixed card height — 2-row panels
+    # keep the original roomier layout untouched.
+    compact = len(metrics) > 2
+    row_step = 44 if compact else 58
+    for kind, label, value, caption, metric_key, resets_at in metrics:
         if kind == "bar":
             trend = history.recent_values(status["tool"], metric_key) if metric_key else None
             warn = _predict_warning(status["tool"], metric_key, value, resets_at) if metric_key else None
             invert = metric_key == "cache_hit_percent"
-            _bar_metric_row(draw, ix0, ix1, y, label, value, caption, trend=trend, warn=warn, invert=invert)
+            _bar_metric_row(draw, ix0, ix1, y, label, value, caption, trend=trend, warn=warn, invert=invert, compact=compact)
         else:
             _stat_metric_row(draw, ix0, ix1, y, label, value, caption)
-        y += 58
+        y += row_step
 
     lifetime_tokens = status.get("lifetime_total_tokens")
     if lifetime_tokens is not None:

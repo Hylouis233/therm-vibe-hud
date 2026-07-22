@@ -83,6 +83,7 @@ def _parse_session(path, mtime):
     usage_percent = None
     usage_resets_at = None
     context_percent = None
+    cache_hit_percent = None
     model = None
 
     for e in events:
@@ -116,9 +117,17 @@ def _parse_session(path, mtime):
                     # turn, blows past the window almost immediately on a long session);
                     # last_token_usage is this turn's actual request size, i.e. the real
                     # current context-window fill.
-                    total = (info.get("last_token_usage") or {}).get("total_tokens")
+                    last = info.get("last_token_usage") or {}
+                    total = last.get("total_tokens")
                     if window and total is not None:
                         context_percent = min(100.0, total / window * 100)
+                    # cached_input_tokens is a subset of input_tokens (OpenAI-style
+                    # reporting), so this is directly "share of this turn's input
+                    # that was served from cache" — same concept as Claude Code's
+                    # cache_hit_percent, different underlying convention.
+                    input_t = last.get("input_tokens")
+                    if input_t:
+                        cache_hit_percent = (last.get("cached_input_tokens") or 0) / input_t * 100
         elif etype == "response_item":
             ptype = payload.get("type")
             if ptype in ("function_call", "custom_tool_call"):
@@ -143,6 +152,7 @@ def _parse_session(path, mtime):
         "usage_percent": usage_percent,
         "usage_resets_at": usage_resets_at,
         "context_percent": context_percent,
+        "cache_hit_percent": cache_hit_percent,
         "model": model,
     }
 
@@ -190,10 +200,16 @@ def _compute_lifetime_stats():
         # the last event seen fully represents this file's lifetime contribution.
         total_tokens += last_usage.get("total_tokens") or 0
         bucket = per_model.setdefault(model or "unknown", {"input": 0, "output": 0, "cache_write": 0, "cache_read": 0})
-        bucket["input"] += last_usage.get("input_tokens") or 0
+        # cached_input_tokens is a subset of input_tokens (OpenAI-style reporting,
+        # unlike Anthropic's additive input/cache_read split) — subtract it out of
+        # the input bucket or estimate_cost_usd double-charges the cached portion
+        # once at full input price and again at cache_read price.
+        input_t = last_usage.get("input_tokens") or 0
+        cache_read_t = last_usage.get("cached_input_tokens") or 0
+        bucket["input"] += input_t - cache_read_t
         bucket["output"] += last_usage.get("output_tokens") or 0
         bucket["cache_write"] += last_usage.get("cache_write_input_tokens") or 0
-        bucket["cache_read"] += last_usage.get("cached_input_tokens") or 0
+        bucket["cache_read"] += cache_read_t
 
     pricing.refresh([m for m in per_model if m != "unknown"])
     cost_usd = 0.0
@@ -405,7 +421,7 @@ def read_status():
     if not files:
         return {**base, "state": "no session", "sessions": [], "active_count": 0,
                 "usage_percent": last_usage_percent, "usage_resets_at": last_usage_resets_at,
-                "context_percent": None, "identity": last_model}
+                "context_percent": None, "cache_hit_percent": None, "identity": last_model}
 
     sessions = []
     for f, mtime in files:
@@ -414,12 +430,13 @@ def read_status():
 
     # rate_limits are account-wide, not per-session — take them from whichever
     # parsed session actually carried a token_count event most recently.
-    usage_percent = usage_resets_at = context_percent = None
+    usage_percent = usage_resets_at = context_percent = cache_hit_percent = None
     for s in sorted(sessions, key=lambda s: -s["updated_at"]):
         if s["usage_percent"] is not None:
             usage_percent = s["usage_percent"]
             usage_resets_at = s["usage_resets_at"]
             context_percent = s["context_percent"]
+            cache_hit_percent = s["cache_hit_percent"]
             break
 
     if usage_percent is None:
@@ -443,6 +460,7 @@ def read_status():
         "usage_percent": usage_percent,
         "usage_resets_at": usage_resets_at,
         "context_percent": context_percent,
+        "cache_hit_percent": cache_hit_percent,
         "identity": identity,
     }
 
