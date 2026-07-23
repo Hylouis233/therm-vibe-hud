@@ -106,6 +106,24 @@ def _format_resets(value):
     return f"resets in {int(hours / 24)}d"
 
 
+# Anthropic's default ephemeral prompt-cache TTL — resets on every turn that
+# touches it, so this is "time left before the next message pays full
+# cache-write cost again", not tied to this session's own idle timer. Accounts
+# on the 1-hour extended-cache beta will see this undercount how long the
+# cache actually survives; there's no local signal to tell the two apart.
+PROMPT_CACHE_TTL_SEC = 5 * 60
+
+
+def _cache_ttl_caption(last_response_at):
+    if last_response_at is None:
+        return ""
+    remaining = last_response_at + PROMPT_CACHE_TTL_SEC - time.time()
+    if remaining <= 0:
+        return "cache expired"
+    m, s = divmod(int(remaining), 60)
+    return f"⏱ {m}m {s}s" if m else f"⏱ {s}s"
+
+
 def _format_uptime(seconds):
     if seconds is None:
         return "—"
@@ -402,19 +420,20 @@ def _usage_metrics(status):
     if tool == "Claude Code":
         five, seven = status.get("usage_percent"), status.get("usage_seven_day_percent")
         hit = status.get("cache_hit_percent")
+        ttl_caption = _cache_ttl_caption(status.get("last_assistant_response_at"))
         if five is None and seven is None:
             # No Anthropic quota API reachable (e.g. a custom ANTHROPIC_BASE_URL) —
             # fall back to real, locally-derived context stats instead of a dead bar.
             ctx_tok = status.get("context_tokens")
             return [
                 ("stat", "CONTEXT", _human_count(ctx_tok) + " tok" if ctx_tok else "—", "", None, None),
-                ("bar", "CACHE HIT", hit, "", "cache_hit_percent", None),
+                ("bar", "CACHE HIT", hit, ttl_caption, "cache_hit_percent", None),
             ]
         resets = _format_resets(status.get("usage_resets_at"))
         return [
             ("bar", "5-HOUR", five, resets or ("no usage data" if five is None else ""), "usage_percent", status.get("usage_resets_at")),
             ("bar", "7-DAY", seven, "", "usage_seven_day_percent", None),
-            ("bar", "CACHE HIT", hit, "", "cache_hit_percent", None),
+            ("bar", "CACHE HIT", hit, ttl_caption, "cache_hit_percent", None),
         ]
     if tool == "Codex":
         limit = status.get("usage_percent")

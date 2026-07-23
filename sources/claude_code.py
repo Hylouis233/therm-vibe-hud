@@ -1,6 +1,7 @@
 import json
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -135,6 +136,7 @@ def _parse_session(path, mtime):
     project = None
     context_tokens = None
     cache_hit_percent = None
+    last_assistant_response_at = None
     model = None
     for e in events:
         cwd = e.get("cwd")
@@ -154,6 +156,17 @@ def _parse_session(path, mtime):
             if total:
                 context_tokens = total
                 cache_hit_percent = cache_read / total * 100
+                # Anthropic's prompt cache is keyed off wall-clock time since the
+                # last turn that actually populated it, not this session's own
+                # idle timer — a usage-bearing turn is always an assistant reply,
+                # so its own event timestamp is exactly that reference point.
+                ts = e.get("timestamp")
+                if ts:
+                    try:
+                        last_assistant_response_at = datetime.fromisoformat(
+                            str(ts).replace("Z", "+00:00")).timestamp()
+                    except (ValueError, TypeError):
+                        pass
         content = msg.get("content")
         if not isinstance(content, list):
             continue
@@ -180,6 +193,7 @@ def _parse_session(path, mtime):
         "updated_at": mtime,
         "context_tokens": context_tokens,
         "cache_hit_percent": cache_hit_percent,
+        "last_assistant_response_at": last_assistant_response_at,
         "model": model,
     }
 
@@ -200,18 +214,20 @@ def read_status():
     files = _recent_transcripts()
     if not files:
         return {**base, "state": "no session", "sessions": [], "active_count": 0,
-                "context_tokens": None, "cache_hit_percent": None, "identity": None}
+                "context_tokens": None, "cache_hit_percent": None,
+                "last_assistant_response_at": None, "identity": None}
 
     parsed = [_parse_session(f, mtime) for f, mtime in files]
 
     # Local, always-available substitute for when usage_percent is unreachable
     # (e.g. a custom ANTHROPIC_BASE_URL with no real Anthropic usage API behind it):
     # context size of whichever session most recently carried a usage event.
-    context_tokens = cache_hit_percent = identity = None
+    context_tokens = cache_hit_percent = last_assistant_response_at = identity = None
     for s in sorted(parsed, key=lambda s: -s["updated_at"]):
         if s["context_tokens"] is not None:
             context_tokens = s["context_tokens"]
             cache_hit_percent = s["cache_hit_percent"]
+            last_assistant_response_at = s["last_assistant_response_at"]
         if identity is None and s.get("model"):
             identity = s["model"]
         if context_tokens is not None and identity is not None:
@@ -224,7 +240,8 @@ def read_status():
     aggregate_state = rows[0]["state"] if rows else "no session"
 
     return {**base, "state": aggregate_state, "sessions": rows, "active_count": active_count, "identity": identity,
-            "context_tokens": context_tokens, "cache_hit_percent": cache_hit_percent}
+            "context_tokens": context_tokens, "cache_hit_percent": cache_hit_percent,
+            "last_assistant_response_at": last_assistant_response_at}
 
 
 if __name__ == "__main__":
