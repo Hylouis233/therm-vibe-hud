@@ -24,6 +24,13 @@ PANEL_W = CANVAS_W // PANEL_COUNT
 CARD_MARGIN = 14
 PAD = 22
 MAX_SESSION_ROWS = 4
+# The last usage row is always CACHE HIT (see _usage_metrics) and can carry a
+# trend sparkline reaching down to bar_y + SPARK_BOT_OFFSET. The lifetime-stats
+# footer that immediately follows it must never start higher than that plus a
+# real gap — shared here so the sparkline and the footer's own floor can't
+# drift out of sync with each other.
+SPARK_BOT_OFFSET = 27
+FOOTER_SPARK_GAP = 7
 
 BG_TOP, BG_BOTTOM = (12, 13, 18), (7, 8, 11)
 CARD_TOP, CARD_BOTTOM = (27, 30, 39), (16, 18, 24)
@@ -94,14 +101,31 @@ def _wrap_segments(draw, segments, font, max_w, sep=" · "):
     return lines
 
 
-def _draw_wrapped_footer(draw, lines, x0, y_top, bottom_limit, font, fill, line_h=18):
+def _wrap_footer_lines(draw, segments, max_w):
+    """Wrap footer segments at the normal caption size first; if that still
+    needs more than one line, retry smaller so a 2-line footer costs less
+    vertical room instead of just being an oversized copy of the 1-line
+    case (which is what actually runs out of room against the row above)."""
+    font, line_h = _mono_font(14), 18
+    lines = _wrap_segments(draw, segments, font, max_w)
+    if len(lines) > 1:
+        font, line_h = _mono_font(12), 14
+        lines = _wrap_segments(draw, segments, font, max_w)
+    return lines, font, line_h
+
+
+def _draw_wrapped_footer(draw, lines, x0, y_top, bottom_limit, font, fill, line_h=18, min_top=None):
     # Anchored to the card's own bottom edge, not just stacked down from
     # y_top: a 1-line footer (the common case) still starts at y_top exactly
     # as before, but a rarer 2-line one (e.g. a long-lived account's lifetime
     # stats) pulls itself up only as far as it actually needs to stay inside
     # the card, instead of assuming a fixed budget that was only ever tuned
-    # for one line.
+    # for one line. min_top is the last usage row's own sparkline floor (when
+    # it has one) — the block still prefers clearing the card edge, but never
+    # gets pulled up far enough to sit on top of that row's trend line.
     y = min(y_top, bottom_limit - line_h * len(lines))
+    if min_top is not None:
+        y = max(y, min_top)
     for i, line in enumerate(lines):
         draw.text((x0, y + i * line_h), line, font=font, fill=fill)
 
@@ -399,7 +423,10 @@ def _bar_metric_row(draw, x0, x1, y, label, pct, caption, trend=None, warn=None,
         # that still guarantees a real 10px gap after the bar in the worst
         # case. Same value in both modes — the sparkline's own geometry
         # doesn't depend on compact, only bar_y (handled separately) does.
-        spark_top, spark_bot = 19, 33
+        # spark_bot trimmed from 33 to SPARK_BOT_OFFSET to keep the last
+        # row's trend line clear of the lifetime-stats footer that can
+        # immediately follow it — still a real ~8px-tall curve.
+        spark_top, spark_bot = 19, SPARK_BOT_OFFSET
         spark_color = _severity_color(pct, invert=invert)
         _sparkline(draw, x0, bar_y + spark_top, spark_x1, bar_y + spark_bot, trend, spark_color)
 
@@ -597,8 +624,14 @@ def _draw_agent_panel(img, x0, status, bg=None, bg_name=None):
             _stat_metric_row(draw, ix0, ix1, y, label, value, caption)
         y += row_step
 
+    # Floor comes from the CACHE HIT row (always last, see _usage_metrics)
+    # own sparkline reach — the footer must never sit on top of it, even
+    # when the bottom-edge anchor below would otherwise pull it up that far.
+    last_bar_y = (y - row_step) + (18 if compact else 22)
+    footer_min_top = last_bar_y + SPARK_BOT_OFFSET + FOOTER_SPARK_GAP
+    footer_bottom_limit = cy1 - 10
+
     lifetime_tokens = status.get("lifetime_total_tokens")
-    footer_font = _mono_font(14)
     if lifetime_tokens is not None:
         sessions_n = status.get("lifetime_session_count")
         cost = _human_cost(status.get("lifetime_cost_usd"))
@@ -608,8 +641,9 @@ def _draw_agent_panel(img, x0, status, bg=None, bg_name=None):
             segments.append("unlimited credits")
         elif status.get("credits_balance"):
             segments.append(f"${status['credits_balance']:,.0f} credits")
-        lines = _wrap_segments(draw, segments, footer_font, ix1 - ix0)
-        _draw_wrapped_footer(draw, lines, ix0, y - 4, cy1 - 6, footer_font, FG_FAINT)
+        lines, footer_font, line_h = _wrap_footer_lines(draw, segments, ix1 - ix0)
+        _draw_wrapped_footer(draw, lines, ix0, y + 4, footer_bottom_limit, footer_font, FG_FAINT,
+                              line_h=line_h, min_top=footer_min_top)
     elif status["tool"] == "zcode":
         sessions_today = status.get("sessions_today")
         session_tokens = status.get("session_tokens")
@@ -617,8 +651,9 @@ def _draw_agent_panel(img, x0, status, bg=None, bg_name=None):
             segments = [f"{_human_count(sessions_today)} sessions today"]
             if session_tokens is not None:
                 segments.append(f"{_human_count(session_tokens)} tok (latest)")
-            lines = _wrap_segments(draw, segments, footer_font, ix1 - ix0)
-            _draw_wrapped_footer(draw, lines, ix0, y - 4, cy1 - 6, footer_font, FG_FAINT)
+            lines, footer_font, line_h = _wrap_footer_lines(draw, segments, ix1 - ix0)
+            _draw_wrapped_footer(draw, lines, ix0, y + 4, footer_bottom_limit, footer_font, FG_FAINT,
+                                  line_h=line_h, min_top=footer_min_top)
 
 
 def _draw_hardware_panel(img, x0, hw, bg=None, bg_name=None):
