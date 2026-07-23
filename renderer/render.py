@@ -141,10 +141,22 @@ def _human_cost(usd):
     return f"${usd:.2f}"
 
 
+# rate_per_hour's own trailing sample is only 3h wide; extrapolating it across
+# a multi-day window (a weekly quota's hours_left can be ~165h) blows a tiny,
+# noisy slope up into a wildly false 100%+ projection — e.g. 9% climbing at
+# 3%/h early in a 7-day window "projects" past 500% even though that pace is
+# completely normal. Capping the look-ahead keeps the warning meaningful for
+# what it's actually for (you're about to blow through a *near-term* bar,
+# like the 5-hour window, before it resets) without manufacturing alarms out
+# of a few hours of ordinary usage inside a much longer window.
+MAX_PROJECTION_HOURS = 12
+
+
 def _predict_warning(tool, metric, current_pct, resets_at):
-    """None, or the projected % this metric will reach by its own reset time
-    if it keeps climbing at its trailing rate — only when that projection
-    would blow past 100%, i.e. actually worth flagging."""
+    """None, or the projected % this metric will reach within the next
+    MAX_PROJECTION_HOURS (or by its own reset time, if sooner) if it keeps
+    climbing at its trailing rate — only when that projection would blow
+    past 100%, i.e. actually worth flagging."""
     if current_pct is None or resets_at is None:
         return None
     try:
@@ -158,7 +170,7 @@ def _predict_warning(tool, metric, current_pct, resets_at):
     rate = history.rate_per_hour(tool, metric)
     if rate is None or rate <= 0:
         return None
-    projected = current_pct + rate * hours_left
+    projected = current_pct + rate * min(hours_left, MAX_PROJECTION_HOURS)
     return projected if projected > 100 else None
 
 
