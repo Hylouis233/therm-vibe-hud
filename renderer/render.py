@@ -77,6 +77,35 @@ def _ellipsize(draw, s, font, max_w):
     return s + "…" if s else ""
 
 
+def _wrap_segments(draw, segments, font, max_w, sep=" · "):
+    """Greedily pack sep-joined segments onto as few lines as fit max_w each —
+    breaks between whole segments (never mid-word), same idea as text-wrap
+    but along the natural ' · '-delimited clauses this caption is built from."""
+    lines, current = [], ""
+    for seg in segments:
+        candidate = f"{current}{sep}{seg}" if current else seg
+        if not current or draw.textlength(candidate, font=font) <= max_w:
+            current = candidate
+        else:
+            lines.append(current)
+            current = seg
+    if current:
+        lines.append(current)
+    return lines
+
+
+def _draw_wrapped_footer(draw, lines, x0, y_top, bottom_limit, font, fill, line_h=18):
+    # Anchored to the card's own bottom edge, not just stacked down from
+    # y_top: a 1-line footer (the common case) still starts at y_top exactly
+    # as before, but a rarer 2-line one (e.g. a long-lived account's lifetime
+    # stats) pulls itself up only as far as it actually needs to stay inside
+    # the card, instead of assuming a fixed budget that was only ever tuned
+    # for one line.
+    y = min(y_top, bottom_limit - line_h * len(lines))
+    for i, line in enumerate(lines):
+        draw.text((x0, y + i * line_h), line, font=font, fill=fill)
+
+
 def _relative_age(updated_at):
     if updated_at is None:
         return "—"
@@ -142,6 +171,8 @@ def _human_count(n):
     if n is None:
         return "—"
     n = float(n)
+    if n >= 1_000_000_000:
+        return f"{n / 1_000_000_000:.1f}B"
     if n >= 1_000_000:
         return f"{n / 1_000_000:.1f}M"
     if n >= 1_000:
@@ -567,24 +598,27 @@ def _draw_agent_panel(img, x0, status, bg=None, bg_name=None):
         y += row_step
 
     lifetime_tokens = status.get("lifetime_total_tokens")
+    footer_font = _mono_font(14)
     if lifetime_tokens is not None:
         sessions_n = status.get("lifetime_session_count")
         cost = _human_cost(status.get("lifetime_cost_usd"))
-        text = f"{_human_count(sessions_n)} sessions · {_human_count(lifetime_tokens)} tok"
-        text += f" · ~{cost} all-time" if cost else " all-time"
+        segments = [f"{_human_count(sessions_n)} sessions", f"{_human_count(lifetime_tokens)} tok"]
+        segments.append(f"~{cost} all-time" if cost else "all-time")
         if status.get("credits_unlimited"):
-            text += " · unlimited credits"
+            segments.append("unlimited credits")
         elif status.get("credits_balance"):
-            text += f" · ${status['credits_balance']:,.0f} credits"
-        draw.text((ix0, y - 4), text, font=_mono_font(13), fill=FG_FAINT)
+            segments.append(f"${status['credits_balance']:,.0f} credits")
+        lines = _wrap_segments(draw, segments, footer_font, ix1 - ix0)
+        _draw_wrapped_footer(draw, lines, ix0, y - 4, cy1 - 6, footer_font, FG_FAINT)
     elif status["tool"] == "zcode":
         sessions_today = status.get("sessions_today")
         session_tokens = status.get("session_tokens")
         if sessions_today or session_tokens is not None:
-            text = f"{_human_count(sessions_today)} sessions today"
+            segments = [f"{_human_count(sessions_today)} sessions today"]
             if session_tokens is not None:
-                text += f" · {_human_count(session_tokens)} tok (latest)"
-            draw.text((ix0, y - 4), text, font=_mono_font(13), fill=FG_FAINT)
+                segments.append(f"{_human_count(session_tokens)} tok (latest)")
+            lines = _wrap_segments(draw, segments, footer_font, ix1 - ix0)
+            _draw_wrapped_footer(draw, lines, ix0, y - 4, cy1 - 6, footer_font, FG_FAINT)
 
 
 def _draw_hardware_panel(img, x0, hw, bg=None, bg_name=None):
