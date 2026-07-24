@@ -82,6 +82,7 @@ def _parse_session(path, mtime):
     last_agent_message = None
     usage_percent = None
     usage_resets_at = None
+    usage_limit_id = None
     context_percent = None
     cache_hit_percent = None
     model = None
@@ -110,6 +111,7 @@ def _parse_session(path, mtime):
                 if primary:
                     usage_percent = primary.get("used_percent")
                     usage_resets_at = primary.get("resets_at")
+                    usage_limit_id = rate_limits.get("limit_id")
                 info = payload.get("info")
                 if info:
                     window = info.get("model_context_window")
@@ -151,6 +153,7 @@ def _parse_session(path, mtime):
         "updated_at": mtime,
         "usage_percent": usage_percent,
         "usage_resets_at": usage_resets_at,
+        "usage_limit_id": usage_limit_id,
         "context_percent": context_percent,
         "cache_hit_percent": cache_hit_percent,
         "model": model,
@@ -566,15 +569,30 @@ def read_status():
         parsed = _parse_session(f, mtime)
         sessions.append(parsed)
 
-    # rate_limits are account-wide, not per-session — take them from whichever
-    # parsed session actually carried a token_count event most recently.
+    # context_percent/cache_hit_percent are genuinely per-session (this
+    # conversation's own context fill / cache ratio), so those still just
+    # come from whichever session was active most recently, unfiltered.
+    # usage_percent is different: it's meant to be the account-wide pool,
+    # not any one session's — a concurrent session on a different model
+    # (e.g. a "GPT-5.3-Codex-Spark" side session) or even a same-limit_id
+    # concurrent session with a different reset window (e.g. sub-agents
+    # spawned together) would otherwise win just for being the newest
+    # thing touched, the same failure mode fixed in
+    # _scan_rollouts_for_last_known — so it's tracked independently here
+    # too and held to the same limit_id/resets_at check.
+    known_resets_at = (_last_live_quota[0]["usage_resets_at"] if _last_live_quota is not None
+                        else _load_persisted_resets_at())
     usage_percent = usage_resets_at = context_percent = cache_hit_percent = None
     for s in sorted(sessions, key=lambda s: -s["updated_at"]):
-        if s["usage_percent"] is not None:
-            usage_percent = s["usage_percent"]
-            usage_resets_at = s["usage_resets_at"]
+        if (usage_percent is None and s["usage_percent"] is not None
+                and s.get("usage_limit_id") == "codex"
+                and (known_resets_at is None or s["usage_resets_at"] == known_resets_at)):
+            usage_percent, usage_resets_at = s["usage_percent"], s["usage_resets_at"]
+        if context_percent is None and s["context_percent"] is not None:
             context_percent = s["context_percent"]
+        if cache_hit_percent is None and s["cache_hit_percent"] is not None:
             cache_hit_percent = s["cache_hit_percent"]
+        if usage_percent is not None and context_percent is not None and cache_hit_percent is not None:
             break
 
     if usage_percent is None:
