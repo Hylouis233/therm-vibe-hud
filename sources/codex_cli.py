@@ -390,8 +390,15 @@ def _scan_rollouts_for_last_known(scan_model_only=False):
                 file_model = payload["model"]
             elif obj.get("type") == "event_msg" and payload.get("type") == "token_count":
                 if not scan_model_only:
-                    primary = (payload.get("rate_limits") or {}).get("primary")
-                    if primary:
+                    rate_limits = payload.get("rate_limits") or {}
+                    primary = rate_limits.get("primary")
+                    # Codex tracks separate quota pools per model variant (e.g. a
+                    # side session on "GPT-5.3-Codex-Spark" has its own, nearly-
+                    # untouched pool). Only limit_id "codex" is the account-wide
+                    # pool the live API and the rest of this trend track — a
+                    # different pool's % would look like a bogus jump/drop if
+                    # trusted here just because its file happened to be newest.
+                    if primary and rate_limits.get("limit_id") == "codex":
                         file_usage_percent = primary.get("used_percent")
                         file_usage_resets_at = primary.get("resets_at")
                 # Cache-hit % is never live-fetched (unlike usage_percent, it
