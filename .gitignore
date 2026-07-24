@@ -6,4 +6,5 @@ preview*.png
 pushloop.log
 usage_history.sqlite3
 pricing_cache.json
+codex_quota_anchor.json
 state.json

@@ -246,6 +246,17 @@ LAST_LIVE_QUOTA_MAX_AGE_SEC = 15 * 60
 # last-used *model*, which doesn't go stale the same way).
 ROLLOUT_QUOTA_STALE_SEC = 3 * 3600
 
+# Persisted across process restarts (unlike _last_live_quota, which starts
+# empty every launch) so a freshly-restarted daemon isn't defenseless against
+# a wrong-pool rollout reading just because it hasn't had a live success yet
+# this run. Only the reset-window boundary is saved, never the % itself —
+# resets_at changes at most every ~7 days, so a somewhat-old file is still a
+# trustworthy pool identity even when the live endpoint has been down for a
+# while (an outright stale boundary just fails safe: nothing in the scan
+# window matches it, so usage_percent comes back None instead of wrong).
+RESETS_AT_ANCHOR_PATH = Path(__file__).resolve().parent.parent / "codex_quota_anchor.json"
+RESETS_AT_ANCHOR_MAX_AGE_SEC = 14 * 24 * 3600
+
 
 def _load_auth_tokens():
     try:
@@ -351,6 +362,35 @@ def _fetch_live_quota():
     return None
 
 
+_persisted_resets_at = None  # lazily loaded once per process: (resets_at, saved_at) or (None, 0)
+
+
+def _load_persisted_resets_at():
+    global _persisted_resets_at
+    if _persisted_resets_at is None:
+        try:
+            data = json.loads(RESETS_AT_ANCHOR_PATH.read_text())
+            _persisted_resets_at = (data.get("resets_at"), data.get("saved_at") or 0)
+        except (OSError, ValueError):
+            _persisted_resets_at = (None, 0)
+    resets_at, saved_at = _persisted_resets_at
+    if resets_at is None or time.time() - saved_at > RESETS_AT_ANCHOR_MAX_AGE_SEC:
+        return None
+    return resets_at
+
+
+def _save_persisted_resets_at(resets_at):
+    global _persisted_resets_at
+    if resets_at is None or (_persisted_resets_at and _persisted_resets_at[0] == resets_at):
+        return
+    now = time.time()
+    _persisted_resets_at = (resets_at, now)
+    try:
+        RESETS_AT_ANCHOR_PATH.write_text(json.dumps({"resets_at": resets_at, "saved_at": now}))
+    except OSError:
+        pass
+
+
 def _scan_rollouts_for_last_known(scan_model_only=False, known_resets_at=None):
     """Fallback source, and the only source for last-used model identity and
     cache-hit % — neither the live usage endpoint nor an idle session (with
@@ -377,6 +417,14 @@ def _scan_rollouts_for_last_known(scan_model_only=False, known_resets_at=None):
     # are sorted newest-first) — a value rejected for being past
     # ROLLOUT_QUOTA_STALE_SEC must not also discard a perfectly good model
     # identity (or a perfectly good OTHER value) from that same file.
+    #
+    # Voting among the scanned files to pick usage_percent's pool without a
+    # known_resets_at was tried and rejected: a single chatty concurrent
+    # session (e.g. a sub-agent burst) can rack up far more token_count
+    # events in its tail than the account's actual main-line usage, so
+    # event-count (or even file-count) majority doesn't reliably track which
+    # pool is real — see _load_persisted_resets_at for the mechanism that
+    # actually solves the no-live-yet gap this was meant to cover.
     now = time.time()
     model = usage_percent = usage_resets_at = cache_hit_percent = None
     for f, mtime in candidates[:LAST_KNOWN_QUOTA_SCAN_FILES]:
@@ -401,10 +449,11 @@ def _scan_rollouts_for_last_known(scan_model_only=False, known_resets_at=None):
                     primary = rate_limits.get("primary")
                     # Codex tracks separate quota pools per model variant (e.g. a
                     # side session on "GPT-5.3-Codex-Spark" has its own, nearly-
-                    # untouched pool). Only limit_id "codex" is the account-wide
-                    # pool the live API and the rest of this trend track — a
-                    # different pool's % would look like a bogus jump/drop if
-                    # trusted here just because its file happened to be newest.
+                    # untouched pool) and even same-limit_id concurrent sessions
+                    # (e.g. sub-agents spawned together) can carry a resets_at
+                    # far off from the account's real window. limit_id alone
+                    # isn't a reliable pool identity — when we have a known
+                    # resets_at to check against, require it to match too.
                     candidate_resets_at = primary.get("resets_at") if primary else None
                     if (primary and rate_limits.get("limit_id") == "codex"
                             and (known_resets_at is None or candidate_resets_at == known_resets_at)):
@@ -457,6 +506,7 @@ def _compute_last_known_quota():
     now = time.time()
     if live is not None:
         _last_live_quota = (live, now)
+        _save_persisted_resets_at(live.get("usage_resets_at"))
     elif _last_live_quota is not None and now - _last_live_quota[1] <= LAST_LIVE_QUOTA_MAX_AGE_SEC:
         # This cycle's live call failed, but we had a good one recently enough
         # to trust — reuse it rather than jumping to a rollout-file snapshot
@@ -469,7 +519,10 @@ def _compute_last_known_quota():
     # The window boundary itself (unlike the % within it) stays valid far
     # longer than LAST_LIVE_QUOTA_MAX_AGE_SEC — reuse it as a pool-identity
     # check even when _last_live_quota is too stale to trust its % directly.
-    known_resets_at = _last_live_quota[0]["usage_resets_at"] if _last_live_quota is not None else None
+    # Nothing live yet this process? Fall back to the last boundary a prior
+    # run persisted, rather than leaving the scan defenseless on cold start.
+    known_resets_at = (_last_live_quota[0]["usage_resets_at"] if _last_live_quota is not None
+                        else _load_persisted_resets_at())
     _fallback_percent, fallback_resets_at, model, fallback_cache_hit = _scan_rollouts_for_last_known(
         scan_model_only=live is not None, known_resets_at=known_resets_at)
     if live is not None:
