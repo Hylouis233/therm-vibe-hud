@@ -351,10 +351,17 @@ def _fetch_live_quota():
     return None
 
 
-def _scan_rollouts_for_last_known(scan_model_only=False):
+def _scan_rollouts_for_last_known(scan_model_only=False, known_resets_at=None):
     """Fallback source, and the only source for last-used model identity and
     cache-hit % — neither the live usage endpoint nor an idle session (with
-    no recent token_count event of its own) exposes them."""
+    no recent token_count event of its own) exposes them.
+
+    known_resets_at, when available, is the resets_at the live endpoint most
+    recently confirmed for the account's real window. Concurrent sessions
+    (e.g. sub-agents spawned together) can carry a differently-scoped pool
+    that also reports limit_id "codex" but a resets_at up to a day off from
+    the real one — limit_id alone isn't a reliable pool identity, so a known
+    resets_at, when we have one, is the stronger match to require."""
     files = glob.glob(str(SESSIONS_DIR / "**" / "rollout-*.jsonl"), recursive=True)
     candidates = []
     for f in files:
@@ -398,9 +405,11 @@ def _scan_rollouts_for_last_known(scan_model_only=False):
                     # pool the live API and the rest of this trend track — a
                     # different pool's % would look like a bogus jump/drop if
                     # trusted here just because its file happened to be newest.
-                    if primary and rate_limits.get("limit_id") == "codex":
+                    candidate_resets_at = primary.get("resets_at") if primary else None
+                    if (primary and rate_limits.get("limit_id") == "codex"
+                            and (known_resets_at is None or candidate_resets_at == known_resets_at)):
                         file_usage_percent = primary.get("used_percent")
-                        file_usage_resets_at = primary.get("resets_at")
+                        file_usage_resets_at = candidate_resets_at
                 # Cache-hit % is never live-fetched (unlike usage_percent, it
                 # has no account-wide API source at all) so this scan is its
                 # ONLY fallback tier — always attempted, even when
@@ -457,7 +466,12 @@ def _compute_last_known_quota():
         print("[codex_cli] live quota fetch failed with no recent cached value "
               "— falling back to rollout-file scan", file=sys.stderr)
 
-    _fallback_percent, fallback_resets_at, model, fallback_cache_hit = _scan_rollouts_for_last_known(scan_model_only=live is not None)
+    # The window boundary itself (unlike the % within it) stays valid far
+    # longer than LAST_LIVE_QUOTA_MAX_AGE_SEC — reuse it as a pool-identity
+    # check even when _last_live_quota is too stale to trust its % directly.
+    known_resets_at = _last_live_quota[0]["usage_resets_at"] if _last_live_quota is not None else None
+    _fallback_percent, fallback_resets_at, model, fallback_cache_hit = _scan_rollouts_for_last_known(
+        scan_model_only=live is not None, known_resets_at=known_resets_at)
     if live is not None:
         return {**_EMPTY_QUOTA, **live, "model": model, "cache_hit_percent": fallback_cache_hit}
     return {**_EMPTY_QUOTA, "usage_percent": _fallback_percent, "usage_resets_at": fallback_resets_at,
