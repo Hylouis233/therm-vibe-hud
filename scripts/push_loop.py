@@ -8,7 +8,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from renderer.render import render  # noqa: E402
-from sources import claude_code, codex_cli, zcode, hardware, history  # noqa: E402
+from sources import claude_code, codex_cli, kimi, minimax, zcode, hardware, history  # noqa: E402
 from scripts import theme  # noqa: E402
 
 TRCC_BIN = "/Applications/TRCC.app/Contents/MacOS/TRCC"
@@ -18,14 +18,20 @@ FRAME_PATH = ROOT / "frame.png"
 # logo if it goes ~2-3s without a new frame, so this must stay well under that.
 INTERVAL_SEC = 1.5
 # Blank the panel after this long with no real keyboard/mouse input — mirrors
-# a normal screensaver. Deliberately NOT tied to Claude Code/Codex/zcode
+# a normal screensaver. Deliberately NOT tied to Claude Code/Codex/Kimi/zcode
 # session state: an actively-running agent still keeps its own transcript
 # "thinking" while the human has walked away, which previously reset this
 # timer every tick and meant the screen never blanked during a long session.
 SCREEN_OFF_IDLE_SEC = 15 * 60
 HID_IDLE_RE = __import__("re").compile(rb'"HIDIdleTime"\s*=\s*(\d+)')
 
-READERS = (claude_code.read_status, codex_cli.read_status, zcode.read_status)
+READERS = (
+    claude_code.read_status,
+    codex_cli.read_status,
+    kimi.read_status,
+    zcode.read_status,
+    minimax.read_status,
+)
 BACKGROUNDS_DIR = ROOT / "assets" / "backgrounds"
 
 _idle_since = None

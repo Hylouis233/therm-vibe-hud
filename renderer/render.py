@@ -3,26 +3,33 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-from PIL import Image, ImageDraw, ImageFont, ImageStat
+from PIL import Image, ImageDraw, ImageEnhance, ImageFont, ImageStat
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from sources import history  # noqa: E402
 
 CANVAS_W, CANVAS_H = 1920, 462
-BACKGROUNDS_DIR = Path(__file__).resolve().parent.parent / "assets" / "backgrounds"
+ROOT = Path(__file__).resolve().parent.parent
+BACKGROUNDS_DIR = ROOT / "assets" / "backgrounds"
+BACKGROUND_BRIGHTNESS = {"Background": 0.22}
 # How much a card's tint shifts toward the artwork behind it, and how
 # see-through the card is over that artwork.
 BG_TINT_STRENGTH = 0.48
-CARD_ALPHA_ON_BG = 226
+# Keep only a 20% dark-card layer in wallpaper mode so the artwork remains
+# visible; the solid-gradient mode below still uses fully opaque cards.
+CARD_ALPHA_ON_BG = round(255 * 0.20)
 # Cap how much brightness a sampled backdrop region can contribute before
 # blending — a bright sky/mist patch behind a card would otherwise wash the
 # tint out toward white and kill text contrast; darker regions (below the
 # cap) pass through unclamped so panels still visibly differ from each other.
 BG_TINT_MAX_CHANNEL = 118
-PANEL_COUNT = 4
+PANEL_COUNT = 6
 PANEL_W = CANVAS_W // PANEL_COUNT
 CARD_MARGIN = 14
-PAD = 22
+PAD = 16
+HEADER_BADGE_SIZE = 32
+HEADER_TITLE_SIZE = 24
+HEADER_GAP = 10
 MAX_SESSION_ROWS = 4
 # The last usage row is always CACHE HIT (see _usage_metrics) and can carry a
 # trend sparkline reaching down to bar_y + SPARK_BOT_OFFSET. The lifetime-stats
@@ -45,9 +52,16 @@ FG_FAINT = (158, 164, 181)
 GOOD = (110, 205, 150)
 WARN = (255, 196, 80)
 BAD = (255, 122, 92)
+ACTIVE = (242, 159, 92)
 NEUTRAL = (100, 106, 124)
 
-STATE_COLORS = {"running": BAD, "thinking": WARN, "idle": GOOD, "no session": NEUTRAL}
+STATE_COLORS = {
+    "running": ACTIVE,
+    "thinking": WARN,
+    "idle": GOOD,
+    "no session": NEUTRAL,
+    "offline": NEUTRAL,
+}
 
 FONT_DIR = Path("/System/Library/Fonts")
 _font_cache = {}
@@ -282,14 +296,24 @@ _bg_cache = {}
 _region_color_cache = {}
 
 
+def _background_path(name):
+    bundled = BACKGROUNDS_DIR / f"{name}.png"
+    if bundled.exists():
+        return bundled
+    return ROOT / f"{name}.png"
+
+
 def _load_background(name):
     if name not in _bg_cache:
-        path = BACKGROUNDS_DIR / f"{name}.png"
+        path = _background_path(name)
         img = None
         if path.exists():
             img = Image.open(path).convert("RGB")
             if img.size != (CANVAS_W, CANVAS_H):
                 img = img.resize((CANVAS_W, CANVAS_H), Image.LANCZOS)
+            brightness = BACKGROUND_BRIGHTNESS.get(name)
+            if brightness is not None:
+                img = ImageEnhance.Brightness(img).enhance(brightness)
         _bg_cache[name] = img
     return _bg_cache[name]
 
@@ -452,6 +476,45 @@ def _two_col_stat_row(draw, x0, x1, y, left_label, left_value, right_label, righ
     draw.text((x0 + half + 16, y + 18), right_value, font=vf, fill=FG_DIM)
 
 
+def _hardware_side_values(hw):
+    fan = hw.get("fan_rpm")
+    temp = hw.get("cpu_temp")
+    swap_used, swap_total = hw.get("swap_used_gb"), hw.get("swap_total_gb")
+
+    if swap_used == 0 and swap_total == 0:
+        swap_text = "0 GB"
+    elif swap_used is not None and swap_total is not None:
+        swap_text = f"{swap_used:.1f}/{swap_total:.0f} GB"
+    else:
+        swap_text = "—"
+
+    return [
+        {
+            "label": "FAN",
+            "value": f"{fan:.0f} RPM" if fan is not None else "—",
+            "color": FG_DIM,
+        },
+        {
+            "label": "TEMP",
+            "value": f"{temp:.0f}°C" if temp is not None else "—",
+            "color": _temp_color(temp),
+        },
+        {
+            "label": "SWAP",
+            "value": swap_text,
+            "color": FG_DIM,
+        },
+    ]
+
+
+def _side_metric_row(draw, x0, x1, y, label, value_text, value_color):
+    lf = _mono_font(12)
+    vf = _mono_font(15)
+    draw.text((x0, y), label, font=lf, fill=FG_FAINT)
+    value_text = _ellipsize(draw, value_text, vf, x1 - x0)
+    draw.text((x0, y + 18), value_text, font=vf, fill=value_color)
+
+
 def _session_row(draw, x0, x1, y, session):
     r = 5
     dot_x = x0 + 3
@@ -468,6 +531,22 @@ def _session_row(draw, x0, x1, y, session):
     proj = _ellipsize(draw, proj, pf, (x1 - text_x) - aw - 12)
     draw.text((text_x, y - 9), proj, font=pf, fill=FG_DIM)
     draw.text((x1 - aw, y - 7), age, font=af, fill=FG_FAINT)
+
+
+def _identity_caption(status):
+    plan_type = status.get("plan_type")
+    plan_text = str(plan_type).replace("_", " ").title() if plan_type else None
+    if status.get("tool") in ("Kimi Code", "MiniMax"):
+        return plan_text
+
+    identity = status.get("identity")
+    if plan_text:
+        return f"{identity} · {plan_text}" if identity else plan_text
+    return identity
+
+
+def _tool_display_name(status):
+    return status.get("display_name") or status["tool"]
 
 
 def _usage_metrics(status):
@@ -511,6 +590,98 @@ def _usage_metrics(status):
             rows.append(("bar", "WEEKLY", secondary, sec_resets or "", "secondary_percent", status.get("secondary_resets_at")))
         rows.append(("bar", "CACHE HIT", status.get("cache_hit_percent"), "", "cache_hit_percent", None))
         return rows
+    if tool == "Kimi Code":
+        monthly = status.get("kimi_monthly_percent")
+        five = status.get("kimi_five_hour_percent")
+        weekly = status.get("kimi_weekly_percent")
+        monthly_resets_at = status.get("kimi_monthly_resets_at")
+        five_resets_at = status.get("kimi_five_hour_resets_at")
+        weekly_resets_at = status.get("kimi_weekly_resets_at")
+        return [
+            ("bar", "MONTHLY", monthly,
+             _format_resets(monthly_resets_at) or ("no usage data" if monthly is None else ""),
+             "kimi_monthly_percent", monthly_resets_at),
+            ("bar", "5-HOUR", five,
+             _format_resets(five_resets_at) or ("no usage data" if five is None else ""),
+             "kimi_five_hour_percent", five_resets_at),
+            ("bar", "WEEKLY", weekly,
+             _format_resets(weekly_resets_at) or ("no usage data" if weekly is None else ""),
+             "kimi_weekly_percent", weekly_resets_at),
+        ]
+    if tool == "MiniMax":
+        five = status.get("minimax_five_hour_percent")
+        five_remaining = status.get("minimax_five_hour_remaining")
+        five_total = status.get("minimax_five_hour_total")
+        five_resets_at = status.get("minimax_five_hour_resets_at")
+        weekly = status.get("minimax_weekly_percent")
+        weekly_remaining = status.get("minimax_weekly_remaining")
+        weekly_total = status.get("minimax_weekly_total")
+        weekly_resets_at = status.get("minimax_weekly_resets_at")
+        five_parts = []
+        if status.get("minimax_five_hour_status") == 3:
+            five_parts.append("unlimited")
+        if five_remaining is not None and five_total:
+            five_parts.append(f"{five_remaining}/{five_total} left")
+        five_reset = _format_resets(five_resets_at)
+        if five_reset:
+            five_parts.append(five_reset)
+        weekly_parts = []
+        if status.get("minimax_weekly_status") == 3:
+            weekly_parts.append("unlimited")
+        if weekly_remaining is not None and weekly_total:
+            weekly_parts.append(f"{weekly_remaining}/{weekly_total} left")
+        weekly_reset = _format_resets(weekly_resets_at)
+        if weekly_reset:
+            weekly_parts.append(weekly_reset)
+        context = status.get("context_percent")
+        context_tokens = status.get("context_tokens")
+        context_window = status.get("context_window")
+        context_caption = ""
+        if context_tokens is not None and context_window:
+            context_caption = (
+                f"{_human_count(context_tokens)} / "
+                f"{_human_count(context_window)} tok"
+            )
+        return [
+            (
+                "bar",
+                "5-HOUR",
+                five,
+                " · ".join(five_parts) or ("no usage data" if five is None else ""),
+                "minimax_five_hour_percent",
+                five_resets_at,
+            ),
+            (
+                "bar",
+                "WEEKLY",
+                weekly,
+                " · ".join(weekly_parts)
+                or ("no usage data" if weekly is None else ""),
+                "minimax_weekly_percent",
+                weekly_resets_at,
+            ),
+            (
+                "bar",
+                "CONTEXT",
+                context,
+                context_caption
+                or ("no session data" if context is None else ""),
+                "context_percent",
+                None,
+            ),
+            (
+                "bar",
+                "CACHE HIT",
+                status.get("cache_hit_percent"),
+                (
+                    "no session data"
+                    if status.get("cache_hit_percent") is None
+                    else ""
+                ),
+                "cache_hit_percent",
+                None,
+            ),
+        ]
     tok, req = status.get("zcode_token_percent"), status.get("zcode_request_percent")
     tok_resets = _format_resets(status.get("zcode_token_resets_at"))
     req_left, req_total = status.get("zcode_request_remaining"), status.get("zcode_request_total")
@@ -525,12 +696,24 @@ def _usage_metrics(status):
     ]
 
 
+def _is_offline_status(status):
+    health = status.get("health")
+    if health is not None:
+        return health == "offline"
+    return status.get("state") in ("no session", "offline")
+
+
+def _session_slot_count(metrics):
+    return 2 if len(metrics) >= 4 else MAX_SESSION_ROWS
+
+
 def _draw_agent_panel(img, x0, status, bg=None, bg_name=None):
     state = status.get("state", "no session")
-    stale = state == "no session"
+    offline = _is_offline_status(status)
+    stale = offline or state == "offline"
     active_count = status.get("active_count", 0)
-    is_active = not stale and active_count > 0
-    accent = STATE_COLORS.get(state, FG_DIM)
+    is_active = not offline and active_count > 0
+    accent = STATE_COLORS.get("offline" if offline else state, FG_DIM)
 
     if is_active:
         top_c = tuple(min(255, c + 6) for c in CARD_TOP)
@@ -551,11 +734,22 @@ def _draw_agent_panel(img, x0, status, bg=None, bg_name=None):
 
     ix0, ix1 = cx0 + PAD, cx1 - PAD
 
-    badge_size = 36
-    _badge(draw, ix0, cy0 + PAD, badge_size, status["tool"][0], accent)
-    draw.text((ix0 + badge_size + 14, cy0 + PAD + 2), status["tool"], font=_title_font(26), fill=FG)
+    display_name = _tool_display_name(status)
+    badge_size = HEADER_BADGE_SIZE
+    _badge(draw, ix0, cy0 + PAD, badge_size, display_name[0], accent)
+    draw.text(
+        (ix0 + badge_size + HEADER_GAP, cy0 + PAD + 2),
+        display_name,
+        font=_title_font(HEADER_TITLE_SIZE),
+        fill=FG,
+    )
 
-    agg_label = "OFFLINE" if stale else (f"{active_count} ACTIVE" if active_count else "IDLE")
+    if stale:
+        agg_label = "OFFLINE"
+    elif active_count:
+        agg_label = f"{active_count} ACTIVE"
+    else:
+        agg_label = "IDLE"
     af = _mono_font(14)
     aw = draw.textlength(agg_label, font=af)
     dot_r = 5
@@ -565,10 +759,7 @@ def _draw_agent_panel(img, x0, status, bg=None, bg_name=None):
     # Which provider/plan/model is actually active — the empty corner below
     # the ACTIVE/OFFLINE label has just enough room for this without costing
     # a dedicated row.
-    identity = status.get("identity")
-    plan_type = status.get("plan_type")
-    if plan_type:
-        identity = f"{identity} · {plan_type.replace('_', ' ').title()}" if identity else plan_type.replace("_", " ").title()
+    identity = _identity_caption(status)
     if identity:
         idf = _mono_font(12)
         identity = _ellipsize(draw, identity, idf, ix1 - ix0)
@@ -591,19 +782,20 @@ def _draw_agent_panel(img, x0, status, bg=None, bg_name=None):
     metrics = _usage_metrics(status)
     compact = len(metrics) > 2
     row_step = 54 if compact else 58
+    session_slots = _session_slot_count(metrics)
 
     sessions = status.get("sessions", [])
     row_h = 27 if compact else 30
     if not sessions:
         draw.text((ix0, y + 4), "No active session", font=_title_font(16), fill=FG_FAINT)
-        y += row_h * MAX_SESSION_ROWS
+        y += row_h * session_slots
     else:
-        shown = sessions[:MAX_SESSION_ROWS]
+        shown = sessions[:session_slots]
         for s in shown:
             _session_row(draw, ix0, ix1, y + 9, s)
             y += row_h
         remaining = len(sessions) - len(shown)
-        slots_left = MAX_SESSION_ROWS - len(shown)
+        slots_left = session_slots - len(shown)
         if remaining > 0 and slots_left > 0:
             draw.text((ix0, y + 2), f"+{remaining} more", font=_mono_font(13), fill=FG_FAINT)
         y += row_h * slots_left
@@ -666,9 +858,14 @@ def _draw_hardware_panel(img, x0, hw, bg=None, bg_name=None):
 
     ix0, ix1 = cx0 + PAD, cx1 - PAD
 
-    badge_size = 36
+    badge_size = HEADER_BADGE_SIZE
     _badge(draw, ix0, cy0 + PAD, badge_size, "HW", accent)
-    draw.text((ix0 + badge_size + 14, cy0 + PAD + 2), "Hardware", font=_title_font(26), fill=FG)
+    draw.text(
+        (ix0 + badge_size + HEADER_GAP, cy0 + PAD + 2),
+        "Hardware",
+        font=_title_font(HEADER_TITLE_SIZE),
+        fill=FG,
+    )
 
     clock = time.strftime("%H:%M:%S")
     cf = _mono_font(14)
@@ -681,25 +878,37 @@ def _draw_hardware_panel(img, x0, hw, bg=None, bg_name=None):
 
     mem_caption = f"{hw['mem_used_gb']:.1f} / {hw['mem_total_gb']:.0f} GB" if hw.get("mem_total_gb") else "—"
     disk_caption = f"{hw['disk_free_gb']:.0f} GB free" if hw.get("disk_free_gb") is not None else "—"
-    temp_caption = f"{hw['cpu_temp']:.0f}°C" if hw.get("cpu_temp") is not None else "—"
 
-    for label, pct, caption in (
-        ("CPU", hw.get("cpu_usage"), temp_caption),
+    side_w = 96
+    side_gap = 14
+    side_x0 = ix1 - side_w
+    side_sep_x = side_x0 - side_gap
+    main_x1 = side_sep_x - side_gap
+    row_step = 58
+    rows = (
+        ("CPU", hw.get("cpu_usage"), ""),
         ("MEMORY", hw.get("mem_percent"), mem_caption),
         ("DISK", hw.get("disk_percent"), disk_caption),
-    ):
-        _bar_metric_row(draw, ix0, ix1, y, label, pct, caption)
-        y += 58
+    )
+    side_values = _hardware_side_values(hw)
+    draw.line([(side_sep_x, y - 2), (side_sep_x, y + row_step * len(rows) - 11)],
+              fill=DIVIDER, width=1)
+
+    for idx, (label, pct, caption) in enumerate(rows):
+        _bar_metric_row(draw, ix0, main_x1, y, label, pct, caption)
+        side = side_values[idx]
+        _side_metric_row(draw, side_x0, ix1, y, side["label"], side["value"], side["color"])
+        y += row_step
 
     y += 4
     _hairline(draw, ix0, ix1, y)
     y += 20
 
-    fan, load1 = hw.get("fan_rpm"), hw.get("load1")
+    load1 = hw.get("load1")
     _two_col_stat_row(
         draw, ix0, ix1, y,
-        "FAN", f"{fan:.0f} RPM" if fan is not None else "—",
         "LOAD (1m)", f"{load1:.2f}" if load1 is not None else "—",
+        "UPTIME", _format_uptime(hw.get("uptime_sec")),
     )
 
     y += 44
@@ -715,16 +924,8 @@ def _draw_hardware_panel(img, x0, hw, bg=None, bg_name=None):
                     if total_up is not None and total_down is not None else "—")
     nf = _mono_font(16)
     nw = draw.textlength(net_text, font=nf)
-    draw.text((ix1 - nw, y - 2), net_text, font=nf, fill=FG_DIM)
-
-    y += 30
-    swap_used, swap_total = hw.get("swap_used_gb"), hw.get("swap_total_gb")
-    swap_text = f"{swap_used:.1f}/{swap_total:.0f} GB" if swap_used is not None and swap_total else "—"
-    _two_col_stat_row(
-        draw, ix0, ix1, y,
-        "UPTIME", _format_uptime(hw.get("uptime_sec")),
-        "SWAP", swap_text,
-    )
+    net_y = y + 15 if nw > (ix1 - ix0) * 0.72 else y - 2
+    draw.text((ix1 - nw, net_y), net_text, font=nf, fill=FG_DIM)
 
 
 def render(agent_statuses, hw_status, background=None):
@@ -744,10 +945,16 @@ if __name__ == "__main__":
     import sys
 
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-    from sources import claude_code, codex_cli, zcode, hardware
+    from sources import claude_code, codex_cli, kimi, minimax, zcode, hardware
 
     background = sys.argv[1] if len(sys.argv) > 1 else None
-    statuses = [claude_code.read_status(), codex_cli.read_status(), zcode.read_status()]
+    statuses = [
+        claude_code.read_status(),
+        codex_cli.read_status(),
+        kimi.read_status(),
+        zcode.read_status(),
+        minimax.read_status(),
+    ]
     hw = hardware.read_status()
     out = render(statuses, hw, background=background)
     out_path = Path(__file__).resolve().parent.parent / "preview.png"

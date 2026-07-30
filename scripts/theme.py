@@ -55,7 +55,7 @@ def cmd_set(target):
         if background:
             new_state["background"] = background
         write_state(new_state)
-        print("switched to: custom dashboard (Claude Code / Codex / zcode / Hardware)")
+        print("switched to: custom dashboard (Claude Code / Codex / Kimi Code / zcode / Hardware)")
         return
 
     result = _run("theme", "cloud-load", DEVICE_KEY, target)
@@ -71,7 +71,10 @@ def cmd_current():
 
 
 def _available_backgrounds():
-    return sorted(p.stem for p in BACKGROUNDS_DIR.glob("*.png") if not p.stem.endswith("_raw"))
+    names = {p.stem for p in BACKGROUNDS_DIR.glob("*.png") if not p.stem.endswith("_raw")}
+    if (ROOT / "Background.png").exists():
+        names.add("Background")
+    return sorted(names)
 
 
 def cmd_bg(action, name=None):

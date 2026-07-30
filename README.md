@@ -1,23 +1,27 @@
 # therm-vibe-hud
 
 A CodexBar-inspired external LCD dashboard for a TRCC-controlled Winbond
-Trofeo Vision 9.16 panel (1920×462). Shows live session and quota status
-for Claude Code, Codex CLI, and zcode side by side with a hardware
-monitor panel — all from real, locally-available data, never fabricated
-placeholders.
+Trofeo Vision 9.16 panel (1920×462). It shows live session, subscription,
+and quota status for Claude Code, Codex, Kimi Code, GLM, and MiniMax
+alongside a hardware monitor — all from real, locally available data,
+never fabricated placeholders.
 
 ## Panels
 
-- **Claude Code** — active sessions, 5-hour/7-day quota bars (falls back
-  to current context size + cache-hit-rate when no Anthropic quota API
-  is reachable, e.g. behind a custom `ANTHROPIC_BASE_URL`), lifetime
-  token/cost tracking.
-- **Codex** — active sessions, live rate-limit % via the same OAuth
-  usage API [CodexBar](https://github.com/steipete/CodexBar) itself
-  calls, plan type, weekly window, credits balance, current
-  context-window fill, lifetime cost.
-- **zcode** — active sessions, token/request quota, which feature is
-  driving request usage, today's session count.
+- **Claude Code** — active sessions, proxy health when a local/private
+  `ANTHROPIC_BASE_URL` is configured, context/cache metrics, and
+  lifetime token/cost tracking.
+- **Codex** — live desktop task state through the local app server,
+  account rate-limit windows through the same OAuth usage API
+  [CodexBar](https://github.com/steipete/CodexBar) calls, current
+  context/cache metrics, and lifetime totals.
+- **Kimi Code** — local daemon/session state, real subscription name,
+  and the account's five-hour and weekly usage windows.
+- **GLM** — ZCode/GLM desktop state, token/request quota, cache usage,
+  and recent local sessions.
+- **MiniMax** — MiniMax Code desktop state, Token Plan tier, five-hour
+  and weekly limits, plus context and cache metrics from matching local
+  sessions.
 - **Hardware** — CPU/memory/disk usage and temperature, fan RPM,
   network throughput, uptime, swap.
 
@@ -56,18 +60,29 @@ For always-on operation, run it under a launchd agent (`KeepAlive` +
 ## How it reads data
 
 Every source module is read-only against tools you already have
-installed — no daemons, no extra accounts:
+installed — no extra accounts and no credentials committed to this
+repository:
 
 - `sources/claude_code.py` tails recent `~/.claude/projects/**/*.jsonl`
-  transcripts.
+  transcripts. If Claude Code uses a loopback, private-LAN, or
+  Tailscale proxy, the module may reuse the existing local
+  `ANTHROPIC_BASE_URL` and token to verify that proxy's health.
 - `sources/codex_cli.py` tails recent `~/.codex/sessions/**/rollout-*.jsonl`
-  files for session state, and calls the same live
+  files, reads desktop task state from Codex's local app server, and
+  calls the same live
   `chatgpt.com/backend-api/wham/usage` endpoint CodexBar uses for
   real-time quota, using the token already stored in `~/.codex/auth.json`.
   A refreshed access token (on 401/403) is kept in memory only for the
   running process — this never writes back to `auth.json`.
-- `sources/zcode.py` reads zcode's own local session SQLite DB and the
-  ZCode desktop app's cached quota snapshot from its Local Storage.
+- `sources/kimi.py` reads Kimi Code's local daemon/session metadata and
+  reuses its existing OAuth credentials for official status/usage
+  endpoints.
+- `sources/zcode.py` reads GLM/ZCode local session SQLite data and
+  entitlement cache, and can reuse existing provider credentials for a
+  live quota refresh.
+- `sources/minimax.py` reads matching Codex/Claude-format local sessions,
+  MiniMax Code desktop state, and the official Token Plan remaining
+  endpoint using credentials already managed by the installed client.
 - `sources/hardware.py` shells out to `vm_stat`, `sysctl`, and TRCC's
   own `system info` command.
 - `sources/pricing.py` fetches the public [models.dev](https://models.dev)
@@ -82,4 +97,9 @@ sources/                one read_status()-style module per data source
 scripts/push_loop.py    the render/push loop that drives the physical panel
 scripts/theme.py        switch between this dashboard and TRCC's official themes
 assets/backgrounds/     ink-wash background art
+tests/                  source and renderer regression tests
 ```
+
+Runtime files such as `frame.png`, previews, logs, SQLite history,
+pricing caches, quota anchors, and `state.json` are intentionally
+ignored by Git.

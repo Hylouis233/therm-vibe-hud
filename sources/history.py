@@ -14,6 +14,8 @@ _last_snapshot_at = 0.0
 _AGENT_METRICS = (
     "usage_percent", "usage_seven_day_percent", "context_percent", "secondary_percent",
     "cache_hit_percent", "zcode_token_percent", "zcode_request_percent",
+    "kimi_monthly_percent", "kimi_five_hour_percent", "kimi_weekly_percent",
+    "minimax_five_hour_percent", "minimax_weekly_percent",
 )
 _HW_METRICS = ("cpu_usage", "mem_percent", "swap_used_gb")
 

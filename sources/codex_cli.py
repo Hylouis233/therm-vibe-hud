@@ -1,6 +1,11 @@
+import base64
 import glob
+import hashlib
 import json
 import os
+import socket
+import struct
+import subprocess
 import sys
 import time
 import urllib.error
@@ -13,10 +18,17 @@ from sources.background_cache import BackgroundCache  # noqa: E402
 
 SESSIONS_DIR = Path.home() / ".codex" / "sessions"
 AUTH_PATH = Path.home() / ".codex" / "auth.json"
+APP_SERVER_CONTROL_SOCKET = (
+    Path.home() / ".codex" / "app-server-control" / "app-server-control.sock"
+)
+APP_SERVER_TIMEOUT_SEC = 0.8
+APP_SERVER_STATUS_CACHE_SEC = 3
+PROCESS_PROBE_CACHE_SEC = 5
 IDLE_THRESHOLD_SEC = 45
 ACTIVE_WINDOW_SEC = 30 * 60
 MAX_SESSIONS = 6
 TAIL_LINES = 80
+SESSION_PREFIX_BYTES = 256 * 1024
 # Rollout lines can embed huge tool output/diffs (seen up to 100MB+ files) —
 # a few hundred *lines* can mean tens of MB of reverse-seek I/O per file, so
 # the lifetime scan bounds by bytes instead: one seek + one read per file,
@@ -34,6 +46,238 @@ OAUTH_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
 LIVE_QUOTA_FETCH_TIMEOUT_SEC = 10
 
 STATE_PRIORITY = {"running": 2, "thinking": 1, "idle": 0}
+
+def _recv_exact(client, size):
+    chunks = []
+    remaining = size
+    while remaining:
+        chunk = client.recv(remaining)
+        if not chunk:
+            raise OSError("app-server socket closed")
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
+
+
+def _websocket_handshake(client):
+    key = base64.b64encode(os.urandom(16)).decode()
+    request = (
+        "GET / HTTP/1.1\r\n"
+        "Host: localhost\r\n"
+        "Upgrade: websocket\r\n"
+        "Connection: Upgrade\r\n"
+        f"Sec-WebSocket-Key: {key}\r\n"
+        "Sec-WebSocket-Version: 13\r\n\r\n"
+    ).encode()
+    client.sendall(request)
+    response = b""
+    while b"\r\n\r\n" not in response and len(response) < 16 * 1024:
+        chunk = client.recv(4096)
+        if not chunk:
+            raise OSError("app-server socket closed during websocket upgrade")
+        response += chunk
+    headers = response.split(b"\r\n\r\n", 1)[0]
+    expected = base64.b64encode(
+        hashlib.sha1((key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()).digest()
+    )
+    if not headers.startswith(b"HTTP/1.1 101 ") or expected.lower() not in headers.lower():
+        raise OSError("app-server websocket upgrade failed")
+
+
+def _websocket_send(client, payload, opcode=0x1):
+    payload = payload if isinstance(payload, bytes) else payload.encode()
+    mask = os.urandom(4)
+    size = len(payload)
+    header = bytearray([0x80 | opcode])
+    if size < 126:
+        header.append(0x80 | size)
+    elif size < 65536:
+        header.append(0x80 | 126)
+        header.extend(struct.pack("!H", size))
+    else:
+        header.append(0x80 | 127)
+        header.extend(struct.pack("!Q", size))
+    masked = bytes(byte ^ mask[index % 4] for index, byte in enumerate(payload))
+    client.sendall(bytes(header) + mask + masked)
+
+
+def _websocket_read(client):
+    fragments = []
+    while True:
+        first, second = _recv_exact(client, 2)
+        finished = bool(first & 0x80)
+        opcode = first & 0x0F
+        masked = bool(second & 0x80)
+        size = second & 0x7F
+        if size == 126:
+            size = struct.unpack("!H", _recv_exact(client, 2))[0]
+        elif size == 127:
+            size = struct.unpack("!Q", _recv_exact(client, 8))[0]
+        mask = _recv_exact(client, 4) if masked else None
+        payload = _recv_exact(client, size)
+        if mask:
+            payload = bytes(byte ^ mask[index % 4] for index, byte in enumerate(payload))
+        if opcode == 0x8:
+            return None
+        if opcode == 0x9:
+            _websocket_send(client, payload, opcode=0xA)
+            continue
+        if opcode in (0x0, 0x1, 0x2):
+            fragments.append(payload)
+            if finished:
+                return b"".join(fragments)
+
+
+def _rpc_send(client, message):
+    _websocket_send(client, json.dumps(message, separators=(",", ":")))
+
+
+def _rpc_response(client, request_id):
+    for _ in range(64):
+        payload = _websocket_read(client)
+        if payload is None:
+            return None
+        try:
+            message = json.loads(payload)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            continue
+        if message.get("id") == request_id:
+            return message
+    return None
+
+
+def _coerce_app_server_threads(payload, now=None):
+    now = time.time() if now is None else now
+    rows = []
+    for thread in payload.get("data") or []:
+        if not isinstance(thread, dict):
+            continue
+        updated_at = thread.get("updatedAt")
+        try:
+            updated_at = float(updated_at)
+        except (TypeError, ValueError):
+            updated_at = 0.0
+        status = thread.get("status")
+        status_type = status.get("type") if isinstance(status, dict) else None
+        if status_type != "active" and now - updated_at > ACTIVE_WINDOW_SEC:
+            continue
+        state = "running" if status_type == "active" else "idle"
+        detail = thread.get("name") or thread.get("preview") or ""
+        if status_type == "systemError":
+            detail = "system error"
+        project = str(thread.get("cwd") or "").replace(str(Path.home()), "~", 1)
+        rows.append(
+            {
+                "state": state,
+                "detail": str(detail)[:60],
+                "project": project,
+                "updated_at": updated_at,
+            }
+        )
+
+    rows.sort(key=lambda row: (-STATE_PRIORITY.get(row["state"], 0), -row["updated_at"]))
+    rows = rows[:MAX_SESSIONS]
+    active_count = sum(row["state"] in ("running", "thinking") for row in rows)
+    return {
+        "state": "running" if active_count else "idle",
+        "sessions": rows,
+        "active_count": active_count,
+        "health": "online",
+        "data_source": "app-server",
+    }
+
+
+def _read_app_server_status():
+    if not APP_SERVER_CONTROL_SOCKET.exists():
+        return None
+    client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    client.settimeout(APP_SERVER_TIMEOUT_SEC)
+    upgraded = False
+    try:
+        client.connect(str(APP_SERVER_CONTROL_SOCKET))
+        _websocket_handshake(client)
+        upgraded = True
+        initialize = {
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "clientInfo": {"name": "therm-vibe-hud", "version": "1"},
+                "capabilities": {
+                    "optOutNotificationMethods": [
+                        "thread/started",
+                        "thread/status/changed",
+                        "thread/tokenUsage/updated",
+                    ]
+                },
+            },
+        }
+        _rpc_send(client, initialize)
+        response = _rpc_response(client, 1)
+        if not response or response.get("error"):
+            return None
+        _rpc_send(client, {"method": "initialized"})
+        request = {
+            "id": 2,
+            "method": "thread/list",
+            "params": {
+                "limit": MAX_SESSIONS,
+                "sortKey": "updated_at",
+                "sortDirection": "desc",
+                "useStateDbOnly": True,
+            },
+        }
+        _rpc_send(client, request)
+        response = _rpc_response(client, 2)
+        result = response.get("result") if response else None
+        return _coerce_app_server_threads(result) if isinstance(result, dict) else None
+    except (OSError, ValueError, json.JSONDecodeError):
+        return None
+    finally:
+        if upgraded:
+            try:
+                _websocket_send(client, b"", opcode=0x8)
+            except OSError:
+                pass
+        client.close()
+
+
+def _read_app_server_probe():
+    return _read_app_server_status() or {}
+
+
+_app_server_cache = BackgroundCache(_read_app_server_probe, APP_SERVER_STATUS_CACHE_SEC)
+
+
+def _app_server_status():
+    return _app_server_cache.get() or None
+
+
+def _probe_desktop_app_server_running():
+    try:
+        result = subprocess.run(
+            ["/bin/ps", "-axo", "command="],
+            capture_output=True,
+            text=True,
+            timeout=0.8,
+            check=False,
+        )
+        cached = result.returncode == 0 and any(
+            line.startswith("/Applications/ChatGPT.app/Contents/Resources/codex ")
+            and " app-server" in line
+            for line in result.stdout.splitlines()
+        )
+    except (OSError, subprocess.SubprocessError):
+        cached = False
+    return cached
+
+
+_desktop_process_cache = BackgroundCache(
+    _probe_desktop_app_server_running, PROCESS_PROBE_CACHE_SEC
+)
+
+
+def _desktop_app_server_running():
+    return bool(_desktop_process_cache.get())
 
 
 def _recent_rollouts():
@@ -56,14 +300,56 @@ def _tail_lines(path, n):
         f.seek(0, 2)
         size = f.tell()
         block = 4096
-        data = b""
+        chunks = []
+        newline_count = 0
         pos = size
-        while data.count(b"\n") <= n and pos > 0:
+        while newline_count <= n and pos > 0:
             step = min(block, pos)
             pos -= step
             f.seek(pos)
-            data = f.read(step) + data
+            chunk = f.read(step)
+            chunks.append(chunk)
+            newline_count += chunk.count(b"\n")
+    data = b"".join(reversed(chunks))
     return data.decode("utf-8", "ignore").splitlines()[-n:]
+
+
+def _session_header(path):
+    try:
+        with open(path, "rb") as file:
+            lines = file.read(SESSION_PREFIX_BYTES).decode(
+                "utf-8", "ignore"
+            ).splitlines()
+    except OSError:
+        return {"project": None, "model": None, "is_subagent": False}
+
+    project = None
+    model = None
+    is_subagent = False
+    for line in lines:
+        try:
+            event = json.loads(line)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        payload = event.get("payload")
+        if not isinstance(payload, dict):
+            continue
+        if event.get("type") == "session_meta":
+            project = payload.get("cwd") or project
+            source = payload.get("source")
+            is_subagent = (
+                isinstance(source, dict) and "subagent" in source
+            ) or is_subagent
+        elif event.get("type") == "turn_context":
+            project = payload.get("cwd") or project
+            model = payload.get("model") or model
+        if model is not None and project is not None and is_subagent:
+            break
+    return {
+        "project": project,
+        "model": model,
+        "is_subagent": is_subagent,
+    }
 
 
 def _parse_session(path, mtime):
@@ -76,7 +362,8 @@ def _parse_session(path, mtime):
         except (json.JSONDecodeError, ValueError):
             continue
 
-    project = None
+    header = _session_header(path)
+    project = header["project"]
     pending_calls = {}
     turn_open = False
     last_agent_message = None
@@ -85,7 +372,8 @@ def _parse_session(path, mtime):
     usage_limit_id = None
     context_percent = None
     cache_hit_percent = None
-    model = None
+    model = header["model"]
+    is_subagent = header["is_subagent"]
 
     for e in events:
         etype = e.get("type")
@@ -95,6 +383,9 @@ def _parse_session(path, mtime):
 
         if etype == "session_meta":
             project = payload.get("cwd") or project
+            source = payload.get("source")
+            if isinstance(source, dict) and "subagent" in source:
+                is_subagent = True
         elif etype == "turn_context":
             project = payload.get("cwd") or project
             model = payload.get("model") or model
@@ -157,6 +448,7 @@ def _parse_session(path, mtime):
         "context_percent": context_percent,
         "cache_hit_percent": cache_hit_percent,
         "model": model,
+        "is_subagent": is_subagent,
     }
 
 
@@ -435,7 +727,10 @@ def _scan_rollouts_for_last_known(scan_model_only=False, known_resets_at=None):
             lines = _tail_bytes(f, LIFETIME_TAIL_BYTES)
         except OSError:
             continue
-        file_model = file_usage_percent = file_usage_resets_at = file_cache_hit_percent = None
+        header = _session_header(Path(f))
+        is_subagent = header["is_subagent"]
+        file_model = None if is_subagent else header["model"]
+        file_usage_percent = file_usage_resets_at = file_cache_hit_percent = None
         for line in lines:
             try:
                 obj = json.loads(line)
@@ -444,7 +739,16 @@ def _scan_rollouts_for_last_known(scan_model_only=False, known_resets_at=None):
             payload = obj.get("payload")
             if not isinstance(payload, dict):
                 continue
-            if obj.get("type") == "turn_context" and payload.get("model"):
+            if obj.get("type") == "session_meta":
+                source = payload.get("source")
+                if isinstance(source, dict) and "subagent" in source:
+                    is_subagent = True
+                    file_model = None
+            elif (
+                obj.get("type") == "turn_context"
+                and payload.get("model")
+                and not is_subagent
+            ):
                 file_model = payload["model"]
             elif obj.get("type") == "event_msg" and payload.get("type") == "token_count":
                 if not scan_model_only:
@@ -543,6 +847,8 @@ def _last_known_quota():
 
 def read_status():
     files = _recent_rollouts()
+    endpoint_status = _app_server_status()
+    desktop_running = endpoint_status is not None or _desktop_app_server_running()
     lifetime_total_tokens, lifetime_session_count, lifetime_cost_usd = _lifetime_stats()
     quota = _last_known_quota()
     last_usage_percent, last_usage_resets_at, last_model, last_cache_hit_percent = (
@@ -558,11 +864,42 @@ def read_status():
         "secondary_resets_at": quota["secondary_resets_at"],
         "credits_balance": quota["credits_balance"],
         "credits_unlimited": quota["credits_unlimited"],
+        "health": "online" if desktop_running else "offline",
+        "data_source": (
+            "app-server"
+            if endpoint_status is not None
+            else ("desktop-process" if desktop_running else "unavailable")
+        ),
     }
     if not files:
-        return {**base, "state": "no session", "sessions": [], "active_count": 0,
-                "usage_percent": last_usage_percent, "usage_resets_at": last_usage_resets_at,
-                "context_percent": None, "cache_hit_percent": last_cache_hit_percent, "identity": last_model}
+        if endpoint_status is not None:
+            runtime = endpoint_status
+        elif desktop_running:
+            runtime = {
+                "state": "idle",
+                "sessions": [
+                    {
+                        "state": "idle",
+                        "detail": "desktop app-server",
+                        "project": "Codex Desktop",
+                        "updated_at": time.time(),
+                    }
+                ],
+                "active_count": 0,
+            }
+        else:
+            runtime = {"state": "no session", "sessions": [], "active_count": 0}
+        return {
+            **base,
+            "state": runtime["state"],
+            "sessions": runtime["sessions"],
+            "active_count": runtime["active_count"],
+            "usage_percent": last_usage_percent,
+            "usage_resets_at": last_usage_resets_at,
+            "context_percent": None,
+            "cache_hit_percent": last_cache_hit_percent,
+            "identity": last_model,
+        }
 
     sessions = []
     for f, mtime in files:
@@ -600,7 +937,16 @@ def read_status():
     if cache_hit_percent is None:
         cache_hit_percent = last_cache_hit_percent
 
-    identity = next((s["model"] for s in sorted(sessions, key=lambda s: -s["updated_at"]) if s.get("model")), None)
+    identity = next(
+        (
+            session["model"]
+            for session in sorted(
+                sessions, key=lambda session: -session["updated_at"]
+            )
+            if session.get("model") and not session.get("is_subagent")
+        ),
+        None,
+    )
     if identity is None:
         identity = last_model
 
@@ -609,6 +955,14 @@ def read_status():
     rows.sort(key=lambda s: (-STATE_PRIORITY.get(s["state"], 0), -s["updated_at"]))
     active_count = sum(1 for s in rows if s["state"] in ("running", "thinking"))
     aggregate_state = rows[0]["state"] if rows else "no session"
+    if endpoint_status is not None:
+        rows = endpoint_status["sessions"]
+        active_count = endpoint_status["active_count"]
+        aggregate_state = endpoint_status["state"]
+    elif not desktop_running:
+        rows = []
+        active_count = 0
+        aggregate_state = "no session"
 
     return {
         **base,
