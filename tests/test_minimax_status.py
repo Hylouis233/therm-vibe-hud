@@ -1,6 +1,7 @@
 import base64
 import json
 import os
+import sqlite3
 import tempfile
 import time
 import unittest
@@ -320,8 +321,8 @@ class MiniMaxStatusTests(unittest.TestCase):
             if session["project"] == "~/claude-project"
         )
         self.assertEqual(claude["context_tokens"], 250_000)
-        self.assertEqual(claude["context_window"], 1_000_000)
-        self.assertEqual(claude["context_percent"], 25.0)
+        self.assertEqual(claude["context_window"], 400_000)
+        self.assertEqual(claude["context_percent"], 62.5)
         self.assertEqual(claude["cache_hit_percent"], 80.0)
 
     def test_online_endpoint_is_idle_without_recent_minimax_session(self):
@@ -458,6 +459,134 @@ class MiniMaxStatusTests(unittest.TestCase):
         self.assertEqual(status["health"], "offline")
         self.assertEqual(status["active_count"], 0)
         self.assertEqual(status["sessions"], [])
+
+
+class MiniMaxRuntimeUsageTests(unittest.TestCase):
+    def _make_db(self, rows, name="runtime-state.sqlite",
+                 table="local_runtime_token_usage"):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        path = Path(tmp.name) / name
+        con = sqlite3.connect(path)
+        con.execute(
+            f"CREATE TABLE {table} (id INTEGER PRIMARY KEY, ts INTEGER, "
+            "model TEXT, input_tokens INTEGER, output_tokens INTEGER, "
+            "cache_read_tokens INTEGER, cache_write_tokens INTEGER)"
+        )
+        con.executemany(
+            f"INSERT INTO {table} (ts, model, input_tokens, cache_read_tokens) "
+            "VALUES (?, ?, ?, ?)",
+            rows,
+        )
+        con.commit()
+        con.close()
+        return path
+
+    def test_derives_context_and_cache_hit_from_newest_turn(self):
+        now_ms = int(time.time() * 1000)
+        path = self._make_db([
+            (now_ms - 60_000, "minimax/MiniMax-M3", 2178, 19814),
+            (now_ms, "minimax/MiniMax-M3", 669, 22889),
+        ])
+
+        with mock.patch.object(minimax, "RUNTIME_DB_PATHS", (path,)):
+            usage = minimax._read_runtime_usage()
+
+        prompt = 669 + 22889
+        self.assertEqual(usage["context_tokens"], prompt)
+        self.assertEqual(usage["context_window"], 400_000)
+        self.assertAlmostEqual(usage["context_percent"], prompt / 400_000 * 100)
+        self.assertAlmostEqual(usage["cache_hit_percent"], 22889 / prompt * 100)
+
+    def test_ignores_a_runtime_db_that_stopped_being_written(self):
+        stale_ms = int((time.time() - minimax.RUNTIME_USAGE_STALE_SEC - 60) * 1000)
+        path = self._make_db([(stale_ms, "minimax/MiniMax-M3", 100, 900)])
+
+        with mock.patch.object(minimax, "RUNTIME_DB_PATHS", (path,)):
+            self.assertEqual(minimax._read_runtime_usage(), {})
+
+    def test_falls_back_to_the_legacy_v1_database(self):
+        now_ms = int(time.time() * 1000)
+        legacy = self._make_db(
+            [(now_ms, "minimax/MiniMax-M2.7", 500, 1500)],
+            name="sqlite.db",
+            table="token_usage",
+        )
+        missing = legacy.parent / "runtime-state.sqlite"
+
+        with mock.patch.object(minimax, "RUNTIME_DB_PATHS", (missing, legacy)):
+            usage = minimax._read_runtime_usage()
+
+        self.assertEqual(usage["context_tokens"], 2000)
+        self.assertEqual(usage["context_window"], 200_000)
+
+    def test_unknown_model_reports_cache_hit_without_a_context_percent(self):
+        now_ms = int(time.time() * 1000)
+        path = self._make_db([(now_ms, "minimax/Some-Future-Model", 100, 900)])
+
+        with mock.patch.object(minimax, "RUNTIME_DB_PATHS", (path,)):
+            usage = minimax._read_runtime_usage()
+
+        self.assertIsNone(usage["context_percent"])
+        self.assertAlmostEqual(usage["cache_hit_percent"], 90.0)
+
+    def test_missing_database_is_not_an_error(self):
+        with mock.patch.object(
+            minimax, "RUNTIME_DB_PATHS", (Path("/nonexistent/runtime-state.sqlite"),)
+        ):
+            self.assertEqual(minimax._read_runtime_usage(), {})
+
+    def test_session_derived_values_win_over_the_runtime_database(self):
+        # The CONTEXT bar sits directly under the session rows, so when a
+        # scanned session has real numbers they must not be overridden.
+        endpoint = {
+            "health": "online", "data_source": "minimax-token-plan",
+            "endpoint_error": None, "plan_type": "Token Plan",
+            "minimax_token_plan": True,
+        }
+        recent = [{
+            "state": "idle", "detail": "", "project": "", "updated_at": time.time(),
+            "context_tokens": 1234, "context_window": 400_000,
+            "context_percent": 12.0, "cache_hit_percent": 50.0,
+        }]
+        runtime = {
+            "context_tokens": 9999, "context_window": 400_000,
+            "context_percent": 99.0, "cache_hit_percent": 99.0,
+        }
+        with (
+            mock.patch.object(minimax, "_endpoint_status", return_value=endpoint),
+            mock.patch.object(minimax, "_recent_minimax_sessions", return_value=recent),
+            mock.patch.object(minimax, "_desktop_running", return_value=False),
+            mock.patch.object(minimax, "_desktop_plan_status", return_value={}),
+            mock.patch.object(minimax, "_runtime_usage", return_value=runtime),
+        ):
+            status = minimax.read_status()
+
+        self.assertEqual(status["context_percent"], 12.0)
+        self.assertEqual(status["cache_hit_percent"], 50.0)
+
+    def test_runtime_database_fills_in_when_no_session_was_scanned(self):
+        endpoint = {
+            "health": "online", "data_source": "minimax-token-plan",
+            "endpoint_error": None, "plan_type": "Token Plan",
+            "minimax_token_plan": True,
+        }
+        runtime = {
+            "context_tokens": 23558, "context_window": 400_000,
+            "context_percent": 5.89, "cache_hit_percent": 97.16,
+        }
+        with (
+            mock.patch.object(minimax, "_endpoint_status", return_value=endpoint),
+            mock.patch.object(minimax, "_recent_minimax_sessions", return_value=[]),
+            mock.patch.object(minimax, "_desktop_running", return_value=True),
+            mock.patch.object(minimax, "_desktop_plan_status", return_value={}),
+            mock.patch.object(minimax, "_runtime_usage", return_value=runtime),
+        ):
+            status = minimax.read_status()
+
+        self.assertEqual(status["context_tokens"], 23558)
+        self.assertAlmostEqual(status["context_percent"], 5.89)
+        self.assertAlmostEqual(status["cache_hit_percent"], 97.16)
 
 
 if __name__ == "__main__":

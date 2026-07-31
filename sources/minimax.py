@@ -2,6 +2,7 @@ import base64
 import hashlib
 import json
 import os
+import sqlite3
 import subprocess
 import sys
 import time
@@ -16,7 +17,7 @@ from sources.background_cache import BackgroundCache
 
 PROVIDER_ENV_PATH = Path.home() / ".claude" / "providers" / "minimax.env"
 DEFAULT_BASE_URL = "https://api.minimaxi.com"
-ENDPOINT_TIMEOUT_SEC = 10
+ENDPOINT_TIMEOUT_SEC = 30
 ENDPOINT_CACHE_SEC = 60
 RESPONSE_MAX_BYTES = 512 * 1024
 DESKTOP_PROCESS_CACHE_SEC = 5
@@ -41,10 +42,34 @@ DESKTOP_ORIGIN = "https://agent.minimaxi.com"
 DESKTOP_MEMBERSHIP_PATH = "/matrix/api/v1/user/get_user_extra_info"
 
 STATE_PRIORITY = {"running": 2, "thinking": 1, "idle": 0}
+# Context ceilings as the local runtime itself is configured (the `limit.context`
+# values in ~/.minimax/config.yaml), not the models' theoretical maximums — the
+# HUD should measure fill against the limit this account actually runs under.
 MINIMAX_CONTEXT_WINDOWS = {
-    "minimax-m3": 1_000_000,
-    "minimax-m2.7": 204_800,
+    "minimax-m3": 400_000,
+    "minimax-m2.7": 200_000,
+    "minimax-m2.5": 204_800,
+    "minimax-m2.1": 204_800,
+    "minimax-m2": 204_800,
 }
+
+# The desktop app (bundle id com.minimax.agent.cn) keeps its agent runtime state
+# here, NOT under Application Support — that directory is just Chromium's
+# browser profile. v2 supersedes the v1 sqlite.db, which stopped being written
+# when the app migrated; prefer v2 and fall back so older installs still report.
+RUNTIME_DB_PATHS = (
+    Path.home() / ".minimax" / "v2" / "sqlite" / "runtime-state.sqlite",
+    Path.home() / ".minimax" / "sqlite.db",
+)
+RUNTIME_TOKEN_TABLES = {
+    "runtime-state.sqlite": "local_runtime_token_usage",
+    "sqlite.db": "token_usage",
+}
+RUNTIME_USAGE_CACHE_SEC = 30
+# A turn's context is the whole prompt it sent: freshly-sent tokens plus the
+# prefix served from cache. Turns are appended within a session, so the newest
+# row is the high-water mark for that session.
+RUNTIME_USAGE_STALE_SEC = 7 * 24 * 3600
 _LOCAL_ENV_KEYS = {
     "MINIMAX_API_KEY",
     "ANTHROPIC_AUTH_TOKEN",
@@ -591,6 +616,72 @@ def _normalize_claude_session(session):
     return normalized
 
 
+def _read_runtime_usage():
+    """Newest per-turn token counts from the desktop app's own runtime DB.
+
+    Without this, CONTEXT and CACHE HIT could only be filled when MiniMax's
+    model was driven through Codex CLI or Claude Code (the HUD scans those two
+    tools' session files for a minimax-* model). Driving the MiniMax desktop
+    app directly left both bars permanently blank.
+
+    Opened read-only but deliberately NOT with immutable=1: the app holds the
+    DB open with an active WAL, and immutable=1 would ignore the WAL and report
+    data hours out of date.
+    """
+    for db_path in RUNTIME_DB_PATHS:
+        if not db_path.exists():
+            continue
+        table = RUNTIME_TOKEN_TABLES.get(db_path.name)
+        if not table:
+            continue
+        try:
+            con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=1)
+            try:
+                cur = con.cursor()
+                cur.execute(
+                    "SELECT ts, model, input_tokens, cache_read_tokens "
+                    f"FROM {table} ORDER BY ts DESC LIMIT 1"
+                )
+                row = cur.fetchone()
+            finally:
+                con.close()
+        except sqlite3.Error:
+            continue
+        if not row:
+            continue
+
+        ts_ms, model, input_tokens, cache_read = row
+        age = time.time() - (ts_ms or 0) / 1000
+        if age > RUNTIME_USAGE_STALE_SEC:
+            continue
+
+        input_tokens = input_tokens or 0
+        cache_read = cache_read or 0
+        prompt_tokens = input_tokens + cache_read
+        if prompt_tokens <= 0:
+            continue
+
+        window = _minimax_context_window(model)
+        return {
+            "context_tokens": prompt_tokens,
+            "context_window": window,
+            "context_percent": (
+                min(100.0, prompt_tokens / window * 100) if window else None
+            ),
+            # cache_read is the part of this prompt served from cache, so the
+            # ratio is against the full prompt, not just the fresh tokens.
+            "cache_hit_percent": cache_read / prompt_tokens * 100,
+        }
+    return {}
+
+
+_runtime_usage_cache = BackgroundCache(_read_runtime_usage, RUNTIME_USAGE_CACHE_SEC)
+
+
+def _runtime_usage():
+    return _runtime_usage_cache.get() or {}
+
+
 def _recent_minimax_sessions():
     sessions = []
     for path, mtime in codex_cli._recent_rollouts():
@@ -681,6 +772,22 @@ def read_status():
         ),
         {},
     )
+    # Sessions scraped from Codex/Claude Code win when present (they reflect
+    # the session rows shown right above these bars); the desktop app's own
+    # runtime DB fills in when MiniMax is being driven from its own app.
+    runtime = _runtime_usage()
+    context_tokens = context_session.get("context_tokens")
+    if context_tokens is None:
+        context_tokens = runtime.get("context_tokens")
+        context_window = runtime.get("context_window")
+        context_percent = runtime.get("context_percent")
+    else:
+        context_window = context_session.get("context_window")
+        context_percent = context_session.get("context_percent")
+    cache_hit_percent = cache_session.get("cache_hit_percent")
+    if cache_hit_percent is None:
+        cache_hit_percent = runtime.get("cache_hit_percent")
+
     return {
         "tool": "MiniMax",
         **endpoint,
@@ -688,10 +795,10 @@ def read_status():
         "sessions": rows,
         "active_count": active_count,
         "desktop_running": desktop_running,
-        "context_tokens": context_session.get("context_tokens"),
-        "context_window": context_session.get("context_window"),
-        "context_percent": context_session.get("context_percent"),
-        "cache_hit_percent": cache_session.get("cache_hit_percent"),
+        "context_tokens": context_tokens,
+        "context_window": context_window,
+        "context_percent": context_percent,
+        "cache_hit_percent": cache_hit_percent,
     }
 
 

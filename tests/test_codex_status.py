@@ -204,6 +204,66 @@ class CodexRuntimeStatusTests(unittest.TestCase):
 
         self.assertEqual(model, "gpt-5.6-sol")
 
+    def test_cache_hit_survives_a_rollout_older_than_the_quota_window(self):
+        # Cache-hit % has no live API source — the rollout scan is its only
+        # tier — and it doesn't decay against a reset window the way
+        # used_percent does. Sharing the quota staleness gate blanked the row
+        # whenever Codex had been idle for a few hours.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            rollout = root / "rollout-main.jsonl"
+            rollout.write_text(
+                json.dumps({"type": "session_meta", "payload": {"source": "cli"}})
+                + "\n"
+                + json.dumps({
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "token_count",
+                        "info": {"last_token_usage": {
+                            "input_tokens": 200, "cached_input_tokens": 150,
+                        }},
+                    },
+                })
+                + "\n"
+            )
+            stale = time.time() - (codex_cli.ROLLOUT_QUOTA_STALE_SEC + 3600)
+            os.utime(rollout, (stale, stale))
+
+            with mock.patch.object(codex_cli, "SESSIONS_DIR", root):
+                _, _, _, cache_hit = codex_cli._scan_rollouts_for_last_known(
+                    scan_model_only=True
+                )
+
+        self.assertAlmostEqual(cache_hit, 75.0)
+
+    def test_cache_hit_is_dropped_once_past_its_own_staleness_window(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            rollout = root / "rollout-main.jsonl"
+            rollout.write_text(
+                json.dumps({"type": "session_meta", "payload": {"source": "cli"}})
+                + "\n"
+                + json.dumps({
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "token_count",
+                        "info": {"last_token_usage": {
+                            "input_tokens": 200, "cached_input_tokens": 150,
+                        }},
+                    },
+                })
+                + "\n"
+            )
+            ancient = time.time() - (codex_cli.ROLLOUT_CACHE_HIT_STALE_SEC + 3600)
+            os.utime(rollout, (ancient, ancient))
+
+            with mock.patch.object(codex_cli, "SESSIONS_DIR", root):
+                _, _, _, cache_hit = codex_cli._scan_rollouts_for_last_known(
+                    scan_model_only=True
+                )
+
+        self.assertIsNone(cache_hit)
+
     def test_desktop_probe_detects_app_server_process(self):
         with mock.patch.object(
             codex_cli.subprocess,
@@ -337,6 +397,51 @@ class CodexRuntimeStatusTests(unittest.TestCase):
 
         self.assertEqual(status["health"], "offline")
         self.assertEqual(status["sessions"], [])
+
+
+class LiveQuotaBackoffTests(unittest.TestCase):
+    def setUp(self):
+        codex_cli._live_quota_failure_count = 0
+        codex_cli._live_quota_backoff_until = 0.0
+
+    def tearDown(self):
+        codex_cli._live_quota_failure_count = 0
+        codex_cli._live_quota_backoff_until = 0.0
+
+    def test_repeated_failures_skip_network_during_backoff_window(self):
+        with (
+            mock.patch.object(
+                codex_cli, "_load_auth_tokens", return_value=("token", None, "acct")
+            ),
+            mock.patch.object(
+                codex_cli, "_fetch_usage_once", side_effect=OSError("network down")
+            ) as fetch_once,
+        ):
+            first = codex_cli._fetch_live_quota()
+            second = codex_cli._fetch_live_quota()
+
+        self.assertIsNone(first)
+        self.assertIsNone(second)
+        # The second call landed inside the just-set backoff window, so it
+        # must never have reached the network at all.
+        fetch_once.assert_called_once()
+        self.assertEqual(codex_cli._live_quota_failure_count, 1)
+
+    def test_success_resets_backoff_state(self):
+        codex_cli._live_quota_failure_count = 3
+        codex_cli._live_quota_backoff_until = 0.0  # already past, so this call is allowed through
+        payload = {"rate_limit": {"primary_window": {"used_percent": 42.0}}}
+        with (
+            mock.patch.object(
+                codex_cli, "_load_auth_tokens", return_value=("token", None, "acct")
+            ),
+            mock.patch.object(codex_cli, "_fetch_usage_once", return_value=payload),
+        ):
+            result = codex_cli._fetch_live_quota()
+
+        self.assertEqual(result["usage_percent"], 42.0)
+        self.assertEqual(codex_cli._live_quota_failure_count, 0)
+        self.assertEqual(codex_cli._live_quota_backoff_until, 0.0)
 
 
 if __name__ == "__main__":

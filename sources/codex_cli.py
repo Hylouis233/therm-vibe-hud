@@ -21,7 +21,7 @@ AUTH_PATH = Path.home() / ".codex" / "auth.json"
 APP_SERVER_CONTROL_SOCKET = (
     Path.home() / ".codex" / "app-server-control" / "app-server-control.sock"
 )
-APP_SERVER_TIMEOUT_SEC = 0.8
+APP_SERVER_TIMEOUT_SEC = 3
 APP_SERVER_STATUS_CACHE_SEC = 3
 PROCESS_PROBE_CACHE_SEC = 5
 IDLE_THRESHOLD_SEC = 45
@@ -43,7 +43,20 @@ LIFETIME_CACHE_TTL_SEC = 5 * 60
 CHATGPT_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
 OAUTH_REFRESH_URL = "https://auth.openai.com/oauth/token"
 OAUTH_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
-LIVE_QUOTA_FETCH_TIMEOUT_SEC = 10
+LIVE_QUOTA_FETCH_TIMEOUT_SEC = 30
+# chatgpt.com is DNS-poisoned on this network (GFW injects unrelated IPs even
+# via public DNS) — urllib's automatic system-proxy detection (via macOS
+# _scproxy) is not reliably picked up from this daemon's LaunchAgent context,
+# so the mihomo/Clash Verge proxy is forced explicitly rather than assumed.
+CHATGPT_PROXY_URL = os.environ.get("THERM_VIBE_HUD_CHATGPT_PROXY", "http://127.0.0.1:7897")
+_proxy_opener = urllib.request.build_opener(
+    urllib.request.ProxyHandler({"http": CHATGPT_PROXY_URL, "https": CHATGPT_PROXY_URL})
+)
+# Sustained outages (e.g. GFW DNS poisoning on chatgpt.com) shouldn't hammer
+# the endpoint every LAST_KNOWN_QUOTA_TTL_SEC (60s) forever — back off
+# exponentially per consecutive failure, capped, until a fetch succeeds.
+LIVE_QUOTA_BACKOFF_BASE_SEC = 60
+LIVE_QUOTA_BACKOFF_MAX_SEC = 10 * 60
 
 STATE_PRIORITY = {"running": 2, "thinking": 1, "idle": 0}
 
@@ -540,6 +553,13 @@ LAST_LIVE_QUOTA_MAX_AGE_SEC = 15 * 60
 # trusting it as a usage_percent source (though it still trusts old files for
 # last-used *model*, which doesn't go stale the same way).
 ROLLOUT_QUOTA_STALE_SEC = 3 * 3600
+# Cache-hit % is a property of how recent work was prompted, not a quota
+# counter racing a reset window, so it doesn't go stale on the same clock:
+# yesterday's real hit rate is still a fair characterization of this account's
+# caching, whereas yesterday's used_percent is not. It also has no live API
+# source at all (the rollout scan is its ONLY tier), so applying the quota
+# window here just blanked the row whenever Codex sat idle for a few hours.
+ROLLOUT_CACHE_HIT_STALE_SEC = 7 * 24 * 3600
 
 # Persisted across process restarts (unlike _last_live_quota, which starts
 # empty every launch) so a freshly-restarted daemon isn't defenseless against
@@ -576,7 +596,7 @@ def _fetch_usage_once(access_token, account_id):
     if account_id:
         headers["ChatGPT-Account-Id"] = account_id
     req = urllib.request.Request(CHATGPT_USAGE_URL, headers=headers)
-    with urllib.request.urlopen(req, timeout=LIVE_QUOTA_FETCH_TIMEOUT_SEC) as resp:
+    with _proxy_opener.open(req, timeout=LIVE_QUOTA_FETCH_TIMEOUT_SEC) as resp:
         return json.loads(resp.read())
 
 
@@ -592,9 +612,28 @@ def _refresh_access_token(refresh_token):
         headers={"Content-Type": "application/json"},
         method="POST",
     )
-    with urllib.request.urlopen(req, timeout=LIVE_QUOTA_FETCH_TIMEOUT_SEC) as resp:
+    with _proxy_opener.open(req, timeout=LIVE_QUOTA_FETCH_TIMEOUT_SEC) as resp:
         payload = json.loads(resp.read())
     return payload.get("access_token")
+
+
+_live_quota_failure_count = 0
+_live_quota_backoff_until = 0.0
+
+
+def _note_live_quota_failure():
+    global _live_quota_failure_count, _live_quota_backoff_until
+    _live_quota_failure_count += 1
+    backoff = min(LIVE_QUOTA_BACKOFF_BASE_SEC * (2 ** (_live_quota_failure_count - 1)),
+                  LIVE_QUOTA_BACKOFF_MAX_SEC)
+    _live_quota_backoff_until = time.time() + backoff
+    return None
+
+
+def _reset_live_quota_backoff():
+    global _live_quota_failure_count, _live_quota_backoff_until
+    _live_quota_failure_count = 0
+    _live_quota_backoff_until = 0.0
 
 
 def _fetch_live_quota():
@@ -603,6 +642,9 @@ def _fetch_live_quota():
     into an old rollout file. Never touches auth.json; refreshed tokens are
     only kept in memory for this process, so this stays strictly read-only
     against Codex CLI's own credential store."""
+    if time.time() < _live_quota_backoff_until:
+        return None
+
     auth = _load_auth_tokens()
     if not auth:
         return None
@@ -617,26 +659,26 @@ def _fetch_live_quota():
                     new_token = _refresh_access_token(refresh_token)
                 except (urllib.error.URLError, OSError, ValueError) as refresh_exc:
                     print(f"[codex_cli] token refresh failed: {refresh_exc}", file=sys.stderr)
-                    return None
+                    return _note_live_quota_failure()
                 if not new_token:
                     print("[codex_cli] token refresh returned no access_token", file=sys.stderr)
-                    return None
+                    return _note_live_quota_failure()
                 access_token = new_token
                 continue
             # Failure reason only — never log headers/tokens/account_id, which
             # could carry the account email downstream.
             print(f"[codex_cli] live quota fetch failed: HTTP {exc.code}", file=sys.stderr)
-            return None
+            return _note_live_quota_failure()
         except (urllib.error.URLError, OSError, ValueError) as exc:
             print(f"[codex_cli] live quota fetch failed: {exc}", file=sys.stderr)
-            return None
+            return _note_live_quota_failure()
 
         rate_limit = payload.get("rate_limit") or {}
         primary = rate_limit.get("primary_window") or {}
         used_percent = primary.get("used_percent")
         if used_percent is None:
             print("[codex_cli] live quota response missing primary_window.used_percent", file=sys.stderr)
-            return None
+            return _note_live_quota_failure()
         secondary = rate_limit.get("secondary_window") or {}
         credits = payload.get("credits") or {}
         credits_balance = credits.get("balance")
@@ -644,6 +686,7 @@ def _fetch_live_quota():
             credits_balance = float(credits_balance) if credits_balance not in (None, "") else None
         except (TypeError, ValueError):
             credits_balance = None
+        _reset_live_quota_backoff()
         return {
             "usage_percent": float(used_percent),
             "usage_resets_at": primary.get("reset_at"),
@@ -654,7 +697,7 @@ def _fetch_live_quota():
             "credits_unlimited": bool(credits.get("unlimited")),
         }
 
-    return None
+    return _note_live_quota_failure()
 
 
 _persisted_resets_at = None  # lazily loaded once per process: (resets_at, saved_at) or (None, 0)
@@ -781,7 +824,7 @@ def _scan_rollouts_for_last_known(scan_model_only=False, known_resets_at=None):
                 and now - mtime <= ROLLOUT_QUOTA_STALE_SEC):
             usage_percent, usage_resets_at = file_usage_percent, file_usage_resets_at
         if (cache_hit_percent is None and file_cache_hit_percent is not None
-                and now - mtime <= ROLLOUT_QUOTA_STALE_SEC):
+                and now - mtime <= ROLLOUT_CACHE_HIT_STALE_SEC):
             cache_hit_percent = file_cache_hit_percent
 
         if model and cache_hit_percent is not None and (scan_model_only or usage_percent is not None):

@@ -12,6 +12,7 @@ class BackgroundCache:
         self._compute = compute
         self._interval_sec = interval_sec
         self._lock = threading.Lock()
+        self._start_lock = threading.Lock()
         self._value = None
         self._thread = None
 
@@ -28,7 +29,13 @@ class BackgroundCache:
 
     def get(self):
         if self._thread is None:
-            self._thread = threading.Thread(target=self._worker, daemon=True)
-            self._thread.start()
+            with self._start_lock:
+                if self._thread is None:
+                    self._thread = threading.Thread(
+                        target=self._worker,
+                        daemon=True,
+                        name=f"background-cache-{id(self):x}",
+                    )
+                    self._thread.start()
         with self._lock:
             return self._value

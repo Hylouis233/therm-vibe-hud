@@ -29,11 +29,15 @@ OAUTH_TOKEN_URL = "https://auth.kimi.com/api/oauth/token"
 OAUTH_CLIENT_ID = "17e5f671-d194-4dfb-9706-5516cb48c098"
 
 USAGE_CACHE_SEC = 60
+USAGE_REQUEST_TIMEOUT_SEC = 30
+OAUTH_REQUEST_TIMEOUT_SEC = 30
 TOKEN_REFRESH_MARGIN_SEC = 60
 ACTIVE_WINDOW_SEC = 30 * 60
 IDLE_THRESHOLD_SEC = 90
 MAX_SESSIONS = 6
 TAIL_BYTES = 512 * 1024
+# Escalating tail sizes for the desktop log — see _read_desktop_subscription.
+DESKTOP_LOG_SCAN_BYTES = (128 * 1024, 512 * 1024, 4 * 1024 * 1024)
 
 STATE_PRIORITY = {"running": 2, "thinking": 1, "idle": 0}
 ACTIVE_EVENT_TYPES = {
@@ -59,6 +63,10 @@ _DESKTOP_MEMBERSHIP_RE = re.compile(
 _usage_cache_at = 0.0
 _usage_cache = {}
 _last_good_usage = {}
+# Log size at the last completed subscription scan, and that scan's result —
+# see _read_desktop_subscription.
+_subscription_scan_key = None
+_subscription_scan_result = {}
 
 
 def _read_json(path):
@@ -120,12 +128,27 @@ def _parse_usage_payload(payload):
                 break
     five = five or {}
 
+    weekly_percent = _percent(summary.get("used"), summary.get("limit"))
+    five_hour_percent = _percent(five.get("used"), five.get("limit"))
+    if (
+        five_hour_percent is None
+        and five.get("used") is None
+        and weekly_percent is not None
+        and weekly_percent >= 100.0
+    ):
+        # Once the weekly quota is exhausted, the API stops reporting the
+        # five-hour window's `used` field at all (instead of reporting it at
+        # cap) — weekly exhaustion implies the 5h window is exhausted too, so
+        # infer 100% rather than showing "no usage data" for a window that's
+        # actually just as capped as its parent.
+        five_hour_percent = 100.0
+
     result = {
-        "kimi_weekly_percent": _percent(summary.get("used"), summary.get("limit")),
+        "kimi_weekly_percent": weekly_percent,
         "kimi_weekly_resets_at": summary.get("resetTime"),
         "kimi_weekly_used": summary.get("used"),
         "kimi_weekly_limit": summary.get("limit"),
-        "kimi_five_hour_percent": _percent(five.get("used"), five.get("limit")),
+        "kimi_five_hour_percent": five_hour_percent,
         "kimi_five_hour_resets_at": five.get("resetTime"),
         "kimi_five_hour_used": five.get("used"),
         "kimi_five_hour_limit": five.get("limit"),
@@ -171,14 +194,47 @@ def _parse_desktop_membership_line(line):
 
 
 def _read_desktop_subscription():
+    """Monthly/omni quota + plan name, scraped from Kimi Desktop's log.
+
+    Scans progressively larger tails instead of a single fixed window: the app
+    only logs `refreshed(sub)` when it actually refreshes the subscription
+    (which can be days apart), while everything else it logs is high-volume, so
+    the newest quota line drifts arbitrarily far from the end of the file. A
+    fixed 128KB window silently lost it once the log grew past that, blanking
+    the MONTHLY bar. Escalating keeps the common case (fresh line, small read)
+    just as cheap while still finding an old line in a large log.
+    """
+    global _subscription_scan_key, _subscription_scan_result
+
+    try:
+        size = DESKTOP_LOG_PATH.stat().st_size
+    except OSError:
+        return {}
+
+    # An incomplete scan escalates all the way to the largest tier, so without
+    # this the "line has aged out entirely" case would re-decode multiple MB on
+    # every 3s poll forever. The log only ever grows (Kimi rotates by replacing
+    # the file, which changes its size), so size is a sound cache key: a new
+    # line to find always means a new size.
+    if _subscription_scan_key == size:
+        return dict(_subscription_scan_result)
+
     result = {}
-    for line in reversed(_tail_lines(DESKTOP_LOG_PATH, max_bytes=128 * 1024)):
-        if "plan_type" not in result:
-            result.update(_parse_desktop_membership_line(line))
-        if "kimi_monthly_percent" not in result:
-            result.update(_parse_desktop_subscription_line(line))
-        if "kimi_monthly_percent" in result and "plan_type" in result:
-            break
+    for max_bytes in DESKTOP_LOG_SCAN_BYTES:
+        for line in reversed(_tail_lines(DESKTOP_LOG_PATH, max_bytes=max_bytes)):
+            if "plan_type" not in result:
+                result.update(_parse_desktop_membership_line(line))
+            if "kimi_monthly_percent" not in result:
+                result.update(_parse_desktop_subscription_line(line))
+            if "kimi_monthly_percent" in result and "plan_type" in result:
+                break
+        else:
+            if size > max_bytes:
+                continue
+        break
+
+    _subscription_scan_key = size
+    _subscription_scan_result = dict(result)
     return result
 
 
@@ -285,7 +341,7 @@ def _post_refresh(refresh_token):
         headers={"Accept": "application/json", "Content-Type": "application/x-www-form-urlencoded"},
         method="POST",
     )
-    with urllib.request.urlopen(request, timeout=15) as response:
+    with urllib.request.urlopen(request, timeout=OAUTH_REQUEST_TIMEOUT_SEC) as response:
         payload = json.load(response)
     return payload if isinstance(payload, dict) else {}
 
@@ -341,7 +397,7 @@ def _fetch_usage_payload(access_token):
         USAGE_URL,
         headers={"Authorization": f"Bearer {access_token}", "Accept": "application/json"},
     )
-    with urllib.request.urlopen(request, timeout=10) as response:
+    with urllib.request.urlopen(request, timeout=USAGE_REQUEST_TIMEOUT_SEC) as response:
         payload = json.load(response)
     return payload if isinstance(payload, dict) else {}
 

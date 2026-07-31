@@ -21,12 +21,23 @@ LOCAL_STORAGE_DIR = (
 )
 BIGMODEL_QUOTA_URL = "https://bigmodel.cn/api/monitor/usage/quota/limit"
 ZAI_QUOTA_URL = "https://api.z.ai/api/monitor/usage/quota/limit"
-LIVE_STATUS_TIMEOUT_SEC = 10
+LIVE_STATUS_TIMEOUT_SEC = 30
 LIVE_ENTITLEMENT_CACHE_SEC = 60
 PROCESS_PROBE_CACHE_SEC = 5
 IDLE_THRESHOLD_SEC = 90
 ACTIVE_WINDOW_SEC = 30 * 60
 MAX_SESSIONS = 6
+CACHE_HIT_SCAN_ROWS = 400
+
+# A quota window's identity in the /monitor/usage/quota/limit payload is the
+# (type, unit, number) triple, decoded from the ZCode desktop bundle's own
+# limit lookup: unit 3=HOUR, 5=MONTH, 6=WEEK. TOKENS_LIMIT/3/5 is the rolling
+# 5-hour prompt pool, TOKENS_LIMIT/6 the weekly token quota, TIME_LIMIT/5/1 the
+# monthly MCP tool-call quota. The weekly entry is emitted server-side only for
+# plans that actually carry that cap, so its absence is normal, not an error.
+UNIT_HOUR = 3
+UNIT_MONTH = 5
+UNIT_WEEK = 6
 
 STATE_PRIORITY = {"running": 2, "thinking": 1, "idle": 0}
 
@@ -35,6 +46,66 @@ _ENTITLEMENT_RE = re.compile(r'\{"cachedAt":\d+,"snapshot":')
 
 def _ms_to_s(ms):
     return ms / 1000 if ms else None
+
+
+def _as_int(value):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _find_limit(limits, limit_type, unit, number=None):
+    for item in limits or []:
+        if not isinstance(item, dict):
+            continue
+        # unit/number are compared as ints: the two backends this talks to
+        # (z.ai and bigmodel.cn) are separate services, and a stringified "3"
+        # failing a strict != against 3 would blank every GLM bar at once with
+        # no error to explain it.
+        if item.get("type") != limit_type or _as_int(item.get("unit")) != unit:
+            continue
+        if number is not None and _as_int(item.get("number")) != number:
+            continue
+        return item
+    return None
+
+
+def _limits_metrics(limits):
+    """Map the quota payload's limits[] onto HUD metric keys.
+
+    Kept separate from the two callers below because the Local Storage
+    snapshot and the live endpoint wrap the same limits[] shape in different
+    envelopes — only the unwrapping differs.
+    """
+    five_hour = _find_limit(limits, "TOKENS_LIMIT", UNIT_HOUR, 5)
+    weekly = _find_limit(limits, "TOKENS_LIMIT", UNIT_WEEK)
+    # The monthly MCP tool quota is what the HUD has always shown as
+    # "REQUESTS" — it counts tool calls (search-prime, web-reader, zread),
+    # not prompts.
+    request_limit = _find_limit(limits, "TIME_LIMIT", UNIT_MONTH, 1)
+
+    usage_details = (request_limit or {}).get("usageDetails") or []
+    top_feature = max(
+        (item for item in usage_details if isinstance(item, dict)),
+        key=lambda item: item.get("usage") or 0,
+        default=None,
+    )
+    if top_feature and not (top_feature.get("usage") or 0):
+        top_feature = None
+
+    return {
+        "zcode_five_hour_percent": (five_hour or {}).get("percentage"),
+        "zcode_five_hour_resets_at": _ms_to_s((five_hour or {}).get("nextResetTime")),
+        "zcode_weekly_percent": (weekly or {}).get("percentage"),
+        "zcode_weekly_resets_at": _ms_to_s((weekly or {}).get("nextResetTime")),
+        "zcode_request_percent": (request_limit or {}).get("percentage"),
+        "zcode_request_remaining": (request_limit or {}).get("remaining"),
+        "zcode_request_total": (request_limit or {}).get("usage"),
+        "zcode_request_resets_at": _ms_to_s((request_limit or {}).get("nextResetTime")),
+        "zcode_top_feature": (top_feature or {}).get("modelCode"),
+        "zcode_top_feature_usage": (top_feature or {}).get("usage"),
+    }
 
 
 def _read_cached_entitlement():
@@ -66,24 +137,9 @@ def _entitlement_metrics():
         return {}
 
     limits = ((snap.get("quota") or {}).get("limits")) or []
-    token_limit = next((l for l in limits if l.get("type") == "TOKENS_LIMIT"), None)
-    request_limit = next((l for l in limits if l.get("type") == "TIME_LIMIT"), None)
-
-    usage_details = (request_limit or {}).get("usageDetails") or []
-    top_feature = max(usage_details, key=lambda d: d.get("usage") or 0, default=None)
-    if top_feature and not (top_feature.get("usage") or 0):
-        top_feature = None
-
     return {
         "zcode_plan": (snap.get("context") or {}).get("displayName"),
-        "zcode_token_percent": (token_limit or {}).get("percentage"),
-        "zcode_token_resets_at": _ms_to_s((token_limit or {}).get("nextResetTime")),
-        "zcode_request_percent": (request_limit or {}).get("percentage"),
-        "zcode_request_remaining": (request_limit or {}).get("remaining"),
-        "zcode_request_total": (request_limit or {}).get("usage"),
-        "zcode_request_resets_at": _ms_to_s((request_limit or {}).get("nextResetTime")),
-        "zcode_top_feature": (top_feature or {}).get("modelCode"),
-        "zcode_top_feature_usage": (top_feature or {}).get("usage"),
+        **_limits_metrics(limits),
     }
 
 
@@ -121,34 +177,9 @@ def _parse_live_entitlement(payload):
     if not isinstance(data, dict):
         return None
 
-    limits = data.get("limits") or []
-    token_limit = next(
-        (item for item in limits if isinstance(item, dict) and item.get("type") == "TOKENS_LIMIT"),
-        None,
-    )
-    request_limit = next(
-        (item for item in limits if isinstance(item, dict) and item.get("type") == "TIME_LIMIT"),
-        None,
-    )
-    usage_details = (request_limit or {}).get("usageDetails") or []
-    top_feature = max(
-        (item for item in usage_details if isinstance(item, dict)),
-        key=lambda item: item.get("usage") or 0,
-        default=None,
-    )
-    if top_feature and not (top_feature.get("usage") or 0):
-        top_feature = None
-
     return {
         "zcode_plan_level_raw": data.get("level"),
-        "zcode_token_percent": (token_limit or {}).get("percentage"),
-        "zcode_token_resets_at": _ms_to_s((token_limit or {}).get("nextResetTime")),
-        "zcode_request_percent": (request_limit or {}).get("percentage"),
-        "zcode_request_remaining": (request_limit or {}).get("remaining"),
-        "zcode_request_total": (request_limit or {}).get("usage"),
-        "zcode_request_resets_at": _ms_to_s((request_limit or {}).get("nextResetTime")),
-        "zcode_top_feature": (top_feature or {}).get("modelCode"),
-        "zcode_top_feature_usage": (top_feature or {}).get("usage"),
+        **_limits_metrics(data.get("limits") or []),
     }
 
 
@@ -202,6 +233,39 @@ _host_process_cache = BackgroundCache(
 
 def _host_process_running():
     return bool(_host_process_cache.get())
+
+
+def _latest_token_stats():
+    """Newest message that actually carries token counts, ignoring sessions.
+
+    The per-session lookup in _read_sessions only reads each session's single
+    newest row, which is usually a zero-token assistant stub, and it only looks
+    at sessions touched in the last ACTIVE_WINDOW_SEC. Cache-hit rate is a
+    property of recent work, not of a currently-open session, so it shouldn't
+    blank out the moment the last session ages past that window. Bounded to
+    CACHE_HIT_SCAN_ROWS rows so a large history stays cheap to scan.
+    """
+    if not DB_PATH.exists():
+        return None, None
+    try:
+        con = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True, timeout=1)
+        try:
+            cur = con.cursor()
+            cur.execute(
+                "SELECT json_extract(data,'$.tokens.total'), "
+                "json_extract(data,'$.tokens.input'), "
+                "json_extract(data,'$.tokens.cache.read') "
+                "FROM message ORDER BY id DESC LIMIT ?",
+                (CACHE_HIT_SCAN_ROWS,),
+            )
+            for total, input_tokens, cache_read in cur.fetchall():
+                if input_tokens:
+                    return total, (cache_read or 0) / input_tokens * 100
+        finally:
+            con.close()
+    except sqlite3.Error:
+        pass
+    return None, None
 
 
 def _read_sessions():
@@ -316,6 +380,13 @@ def _read_sessions():
                 con.close()
         except sqlite3.Error:
             pass
+
+    if latest_cache_hit_percent is None or latest_tokens is None:
+        scanned_tokens, scanned_hit = _latest_token_stats()
+        if latest_tokens is None:
+            latest_tokens = scanned_tokens
+        if latest_cache_hit_percent is None:
+            latest_cache_hit_percent = scanned_hit
 
     sessions.sort(key=lambda s: (-STATE_PRIORITY.get(s["state"], 0), -s["updated_at"]))
     return sessions[:MAX_SESSIONS], latest_tokens, sessions_today, latest_cache_hit_percent

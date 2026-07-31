@@ -1,4 +1,5 @@
 import unittest
+from unittest import mock
 
 from renderer import render as renderer
 from scripts import theme
@@ -121,6 +122,106 @@ class SixPanelLayoutTests(unittest.TestCase):
         self.assertNotIn("ACCESS", [row[1] for row in rows])
         self.assertNotIn("QUOTA", [row[1] for row in rows])
 
+    def test_minimax_unlimited_weekly_uses_infinity_sentinel(self):
+        rows = renderer._usage_metrics({
+            "tool": "MiniMax",
+            "minimax_token_plan": True,
+            "minimax_five_hour_percent": 6.0,
+            "minimax_five_hour_status": 1,
+            "minimax_weekly_percent": 0.0,
+            "minimax_weekly_remaining": 0,
+            "minimax_weekly_total": 0,
+            "minimax_weekly_status": 3,
+            "minimax_weekly_resets_at": "2030-01-02T00:00:00Z",
+        })
+
+        weekly_row = next(row for row in rows if row[1] == "WEEKLY")
+        self.assertEqual(weekly_row[2], float("inf"))
+        self.assertNotIn("unlimited", weekly_row[3])
+
+    def test_bar_metric_row_renders_infinity_symbol_in_violet(self):
+        from PIL import Image, ImageDraw
+
+        img = Image.new("RGB", (400, 80), (0, 0, 0))
+        draw = ImageDraw.Draw(img)
+        renderer._bar_metric_row(draw, 10, 390, 10, "WEEKLY", float("inf"), "")
+
+        pixels = list(img.get_flattened_data())
+        self.assertIn(renderer.VIOLET, pixels)
+        self.assertNotIn((255, 122, 92), pixels)  # BAD — must not read as an error state
+
+    def test_pace_warning_keeps_the_reset_countdown(self):
+        # The warning used to replace the caption outright, dropping the
+        # "resets in …" countdown that makes the warning actionable.
+        from PIL import Image, ImageDraw
+        img = Image.new("RGB", (400, 80), (0, 0, 0))
+        draw = ImageDraw.Draw(img)
+        captured = []
+        original = draw.text
+
+        def spy(xy, text, *args, **kwargs):
+            captured.append(text)
+            return original(xy, text, *args, **kwargs)
+
+        with mock.patch.object(draw, "text", side_effect=spy):
+            renderer._bar_metric_row(
+                draw, 10, 390, 10, "5-HOUR", 88.0, "resets in 2h 4m", warn=169.0
+            )
+
+        caption = next(t for t in captured if "resets in 2h 4m" in t)
+        self.assertIn("169%", caption)
+
+    def test_overlong_caption_is_ellipsized_to_the_row_width(self):
+        from PIL import Image, ImageDraw
+        img = Image.new("RGB", (400, 80), (0, 0, 0))
+        draw = ImageDraw.Draw(img)
+        x0, x1 = 10, 200
+        captured = []
+        original = draw.text
+
+        def spy(xy, text, *args, **kwargs):
+            captured.append((xy, text, kwargs.get("font")))
+            return original(xy, text, *args, **kwargs)
+
+        long_caption = "887/1000 left · resets in 15d · top: search-prime 69"
+        with mock.patch.object(draw, "text", side_effect=spy):
+            renderer._bar_metric_row(draw, x0, x1, 10, "TOOLS", 11.0, long_caption)
+
+        xy, text, font = next(
+            (xy, t, f) for xy, t, f in captured if "887/1000" in t
+        )
+        self.assertLessEqual(draw.textlength(text, font=font), x1 - x0)
+        self.assertGreaterEqual(xy[0], x0)
+
+    def test_zcode_rows_expose_five_hour_weekly_and_tools(self):
+        rows = renderer._usage_metrics({
+            "tool": "zcode",
+            "zcode_five_hour_percent": 100,
+            "zcode_five_hour_resets_at": 4102444800,
+            "zcode_weekly_percent": 42,
+            "zcode_weekly_resets_at": 4102444800,
+            "zcode_request_percent": 11,
+            "zcode_request_remaining": 887,
+            "zcode_request_total": 1000,
+            "cache_hit_percent": 99.8,
+        })
+
+        self.assertEqual(
+            [row[1] for row in rows], ["5-HOUR", "WEEKLY", "TOOLS", "CACHE HIT"]
+        )
+        self.assertEqual(rows[0][4], "zcode_five_hour_percent")
+        self.assertEqual(rows[1][4], "zcode_weekly_percent")
+
+    def test_zcode_omits_weekly_row_when_plan_has_no_weekly_cap(self):
+        rows = renderer._usage_metrics({
+            "tool": "zcode",
+            "zcode_five_hour_percent": 100,
+            "zcode_weekly_percent": None,
+            "zcode_request_percent": 11,
+        })
+
+        self.assertNotIn("WEEKLY", [row[1] for row in rows])
+
     def test_four_usage_rows_reserve_two_session_slots(self):
         metrics = renderer._usage_metrics({
             "tool": "MiniMax",
@@ -183,6 +284,55 @@ class SixPanelLayoutTests(unittest.TestCase):
         image = renderer.render(statuses, hw)
 
         self.assertEqual(image.size, (renderer.CANVAS_W, renderer.CANVAS_H))
+
+    def test_six_panel_render_with_minimax_unlimited_weekly(self):
+        statuses = [
+            {
+                "tool": tool,
+                "state": "no session",
+                "sessions": [],
+                "active_count": 0,
+            }
+            for tool in ("Claude Code", "Codex", "Kimi Code", "zcode")
+        ]
+        statuses.append({
+            "tool": "MiniMax",
+            "state": "no session",
+            "sessions": [],
+            "active_count": 0,
+            "minimax_token_plan": True,
+            "minimax_five_hour_percent": 6.0,
+            "minimax_five_hour_status": 1,
+            "minimax_weekly_percent": 0.0,
+            "minimax_weekly_remaining": 0,
+            "minimax_weekly_total": 0,
+            "minimax_weekly_status": 3,
+            "minimax_weekly_resets_at": "2030-01-02T00:00:00Z",
+        })
+        hw = {
+            "cpu_temp": None,
+            "cpu_usage": None,
+            "mem_percent": None,
+            "mem_used_gb": None,
+            "mem_total_gb": None,
+            "disk_percent": None,
+            "disk_free_gb": None,
+            "fan_rpm": None,
+            "load1": None,
+            "net_up_kbps": None,
+            "net_down_kbps": None,
+            "net_total_up_gb": None,
+            "net_total_down_gb": None,
+            "uptime_sec": None,
+            "swap_used_gb": None,
+            "swap_total_gb": None,
+        }
+
+        image = renderer.render(statuses, hw)
+
+        self.assertEqual(image.size, (renderer.CANVAS_W, renderer.CANVAS_H))
+        pixels = list(image.get_flattened_data())
+        self.assertIn(renderer.VIOLET, pixels)
 
 
 if __name__ == "__main__":

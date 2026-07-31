@@ -19,7 +19,7 @@ IDLE_THRESHOLD_SEC = 45
 ACTIVE_WINDOW_SEC = 30 * 60  # a session stops counting as a "parallel thread" after this
 MAX_SESSIONS = 6
 TAIL_LINES = 60
-PROXY_STATUS_TIMEOUT_SEC = 5
+PROXY_STATUS_TIMEOUT_SEC = 30
 PROXY_STATUS_CACHE_SEC = 15
 PROXY_RESPONSE_MAX_BYTES = 512 * 1024
 # Cache maintained by the user's own active statusLine (OMC's hud) after every

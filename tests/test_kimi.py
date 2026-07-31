@@ -9,6 +9,15 @@ from sources import kimi
 
 
 class KimiUsageTests(unittest.TestCase):
+    def setUp(self):
+        # _read_desktop_subscription memoizes on log size; distinct fixtures in
+        # different tests can collide on size, so clear it between tests.
+        patcher = mock.patch.multiple(
+            kimi, _subscription_scan_key=None, _subscription_scan_result={}
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_parses_weekly_and_five_hour_usage(self):
         parsed = kimi._parse_usage_payload({
             "usage": {"used": "25", "limit": "100", "resetTime": "2030-01-08T00:00:00Z"},
@@ -22,6 +31,19 @@ class KimiUsageTests(unittest.TestCase):
         self.assertEqual(parsed["kimi_five_hour_percent"], 15.0)
         self.assertEqual(parsed["kimi_weekly_resets_at"], "2030-01-08T00:00:00Z")
         self.assertEqual(parsed["kimi_five_hour_resets_at"], "2030-01-01T05:00:00Z")
+
+    def test_infers_five_hour_full_when_weekly_exhausted_and_used_missing(self):
+        parsed = kimi._parse_usage_payload({
+            "usage": {"used": "100", "limit": "100", "resetTime": "2030-01-08T00:00:00Z"},
+            "limits": [{
+                "window": {"duration": 300, "timeUnit": "TIME_UNIT_MINUTE"},
+                "detail": {"limit": "20", "resetTime": "2030-01-01T05:00:00Z"},
+            }],
+        })
+
+        self.assertEqual(parsed["kimi_weekly_percent"], 100.0)
+        self.assertEqual(parsed["kimi_five_hour_percent"], 100.0)
+        self.assertIsNone(parsed["kimi_five_hour_used"])
 
     def test_keeps_internal_membership_level_out_of_plan_caption(self):
         parsed = kimi._parse_usage_payload({
@@ -59,6 +81,92 @@ class KimiUsageTests(unittest.TestCase):
 
         self.assertEqual(parsed["plan_type"], "Vivace")
         self.assertAlmostEqual(parsed["kimi_monthly_percent"], 15.46)
+
+    def test_finds_subscription_line_beyond_the_first_tail_window(self):
+        # The app logs refreshed(sub) only when it actually refreshes the
+        # subscription, so the newest one drifts arbitrarily far from the end
+        # of a busy log. A single fixed-size tail silently lost it and blanked
+        # the MONTHLY bar; the scan must escalate until it finds the line.
+        with tempfile.TemporaryDirectory() as tmp:
+            log_path = Path(tmp) / "main.log"
+            filler = "[info] [LoadingFlow] did-start-navigation url=x\n"
+            log_path.write_text(
+                "[SubscriptionManager] refreshed(sub): level=30 isMember=true "
+                "omniRatio=0.2313 exhausted=false "
+                "resetAt=2026-08-28T00:00:00.000Z\n"
+                "[KimiAgent] commercialInfo sending (subscription-refresh): "
+                "membershipLevel=Vivace canvas=2 localConversation=20 other=20\n"
+                + filler * 8000
+            )
+            self.assertGreater(
+                log_path.stat().st_size, kimi.DESKTOP_LOG_SCAN_BYTES[0]
+            )
+
+            with mock.patch.object(kimi, "DESKTOP_LOG_PATH", log_path):
+                parsed = kimi._read_desktop_subscription()
+
+        self.assertAlmostEqual(parsed["kimi_monthly_percent"], 23.13)
+        self.assertEqual(parsed["plan_type"], "Vivace")
+
+    def test_subscription_scan_stops_at_file_size_when_line_absent(self):
+        # A log with no subscription line at all must not keep re-reading the
+        # whole file once for every escalation tier.
+        with tempfile.TemporaryDirectory() as tmp:
+            log_path = Path(tmp) / "main.log"
+            log_path.write_text("[info] nothing quota-related here\n")
+
+            with mock.patch.object(kimi, "DESKTOP_LOG_PATH", log_path):
+                with mock.patch.object(
+                    kimi, "_tail_lines", wraps=kimi._tail_lines
+                ) as tail:
+                    parsed = kimi._read_desktop_subscription()
+
+        self.assertEqual(parsed, {})
+        self.assertEqual(tail.call_count, 1)
+
+    def test_repeated_scans_do_not_rescan_an_unchanged_log(self):
+        # When the line has aged past even the largest tier, the scan reads
+        # every tier before giving up — doing that on each 3s poll would burn
+        # multiple MB of decoding forever.
+        with tempfile.TemporaryDirectory() as tmp:
+            log_path = Path(tmp) / "main.log"
+            log_path.write_text(
+                "[info] [LoadingFlow] did-start-navigation url=x\n" * 4000
+            )
+            self.assertGreater(
+                log_path.stat().st_size, kimi.DESKTOP_LOG_SCAN_BYTES[0]
+            )
+
+            with mock.patch.object(kimi, "DESKTOP_LOG_PATH", log_path):
+                with mock.patch.object(
+                    kimi, "_tail_lines", wraps=kimi._tail_lines
+                ) as tail:
+                    self.assertEqual(kimi._read_desktop_subscription(), {})
+                    first_pass = tail.call_count
+                    self.assertEqual(kimi._read_desktop_subscription(), {})
+                    self.assertEqual(tail.call_count, first_pass)
+
+    def test_rescans_after_the_log_grows(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            log_path = Path(tmp) / "main.log"
+            log_path.write_text("[info] nothing yet\n")
+
+            with mock.patch.object(kimi, "DESKTOP_LOG_PATH", log_path):
+                self.assertEqual(kimi._read_desktop_subscription(), {})
+
+                with log_path.open("a") as handle:
+                    handle.write(
+                        "[SubscriptionManager] refreshed(sub): level=30 "
+                        "isMember=true omniRatio=0.31 exhausted=false "
+                        "resetAt=2026-08-28T00:00:00.000Z\n"
+                        "[KimiAgent] commercialInfo sending: "
+                        "membershipLevel=Vivace canvas=2\n"
+                    )
+
+                parsed = kimi._read_desktop_subscription()
+
+        self.assertAlmostEqual(parsed["kimi_monthly_percent"], 31.0)
+        self.assertEqual(parsed["plan_type"], "Vivace")
 
     def test_desktop_daemon_is_idle_when_online_without_active_turns(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -35,7 +35,7 @@ class ClaudeCodeProxyStatusTests(unittest.TestCase):
                 json.dumps(
                     {
                         "env": {
-                            "ANTHROPIC_BASE_URL": "http://100.64.0.1:8317",
+                            "ANTHROPIC_BASE_URL": "http://100.112.53.52:8317",
                             "ANTHROPIC_AUTH_TOKEN": "proxy-secret",
                         }
                     }
@@ -54,11 +54,11 @@ class ClaudeCodeProxyStatusTests(unittest.TestCase):
             ):
                 config = claude_code._load_proxy_config()
 
-        self.assertEqual(config["base_url"], "http://100.64.0.1:8317")
+        self.assertEqual(config["base_url"], "http://100.112.53.52:8317")
         self.assertEqual(config["token"], "proxy-secret")
 
     def test_tailscale_host_is_eligible_for_local_proxy_probe(self):
-        self.assertTrue(claude_code._is_local_proxy_host("100.64.0.1"))
+        self.assertTrue(claude_code._is_local_proxy_host("100.112.53.52"))
         self.assertFalse(claude_code._is_local_proxy_host("api.anthropic.com"))
 
     def test_empty_proxy_sentinel_clears_cached_health(self):
@@ -91,7 +91,7 @@ class ClaudeCodeProxyStatusTests(unittest.TestCase):
                 claude_code,
                 "_load_proxy_config",
                 return_value={
-                    "base_url": "http://100.64.0.1:8317",
+                    "base_url": "http://100.112.53.52:8317",
                     "token": "proxy-secret",
                 },
             ),
@@ -119,7 +119,7 @@ class ClaudeCodeProxyStatusTests(unittest.TestCase):
                 claude_code,
                 "_load_proxy_config",
                 return_value={
-                    "base_url": "http://100.64.0.1:8317",
+                    "base_url": "http://100.112.53.52:8317",
                     "token": "bad-secret",
                 },
             ),

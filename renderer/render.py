@@ -54,6 +54,7 @@ WARN = (255, 196, 80)
 BAD = (255, 122, 92)
 ACTIVE = (242, 159, 92)
 NEUTRAL = (100, 106, 124)
+VIOLET = (167, 139, 250)
 
 STATE_COLORS = {
     "running": ACTIVE,
@@ -407,17 +408,32 @@ def _bar_metric_row(draw, x0, x1, y, label, pct, caption, trend=None, warn=None,
         draw.text((x1 - nw, y + (20 if compact else 24)), note, font=nf, fill=FG_FAINT)
         return
 
-    pct_text = f"{pct:.0f}%"
-    color = BAD if warn else _severity_color(pct, invert=invert)
-    pw = draw.textlength(pct_text, font=lf)
-    draw.text((x1 - pw, y), pct_text, font=lf, fill=color)
+    # An uncapped quota tier (e.g. MiniMax weekly on an unlimited plan) is
+    # signaled by the caller as +inf rather than the real (near-0%) used
+    # value — 0% used reads as "barely touched", which is the opposite of
+    # what an unlimited tier means. Shown as a full violet bar + ∞ instead.
+    unlimited = pct == float("inf")
+    pct_text = "∞" if unlimited else f"{pct:.0f}%"
+    inf_font = _mono_font(16)
+    color = VIOLET if unlimited else (BAD if warn else _severity_color(pct, invert=invert))
+    pw = draw.textlength(pct_text, font=inf_font if unlimited else lf)
+    draw.text((x1 - pw, y - (1 if unlimited else 0)), pct_text, font=inf_font if unlimited else lf, fill=color)
 
     # compact=True packs 3 rows into the space 2 normally use (panels that gained
     # a CACHE HIT row) — same bar thickness for visual consistency, tighter gaps.
     bar_y = y + (18 if compact else 22)
-    _capsule_bar(draw, x0, bar_y, x1, 8, pct, color)
+    _capsule_bar(draw, x0, bar_y, x1, 8, 100 if unlimited else pct, color)
 
-    caption_text = f"⚠ pace → {warn:.0f}% by reset" if warn else caption
+    # A pace warning used to REPLACE the caption, which silently dropped the
+    # "resets in …" countdown — the single most-wanted number on the row, and
+    # exactly the context that makes a pace warning actionable. Keep both, and
+    # drop the warning's own "by reset" wording since the countdown now says it.
+    if warn:
+        caption_text = f"⚠ pace → {warn:.0f}%"
+        if caption:
+            caption_text = f"{caption_text} · {caption}"
+    else:
+        caption_text = caption
     spark_x1 = x1
     # cap_gap is measured from bar_y, not from the bar's bottom edge (bar_y +
     # thickness=8) — must clear that plus the font's own ink offset (glyphs
@@ -430,8 +446,13 @@ def _bar_metric_row(draw, x0, x1, y, label, pct, caption, trend=None, warn=None,
     cap_size = 11 if compact else 12
     if caption_text:
         cf = _mono_font(cap_size)
+        # Captions are right-anchored at x1, so an over-long one runs off the
+        # card's left edge (and under the label) instead of being clipped —
+        # ellipsize against the row's real width rather than letting it bleed.
+        caption_text = _ellipsize(draw, caption_text, cf, x1 - x0)
         cw = draw.textlength(caption_text, font=cf)
-        draw.text((x1 - cw, bar_y + cap_gap), caption_text, font=cf, fill=BAD if warn else FG_FAINT)
+        caption_color = VIOLET if unlimited else (BAD if warn else FG_FAINT)
+        draw.text((x1 - cw, bar_y + cap_gap), caption_text, font=cf, fill=caption_color)
         spark_x1 = x1 - cw - 14
 
     # Sparkline fills whatever horizontal space the caption doesn't use —
@@ -625,9 +646,12 @@ def _usage_metrics(status):
         five_reset = _format_resets(five_resets_at)
         if five_reset:
             five_parts.append(five_reset)
+        # Weekly unlimited is now conveyed visually (∞ + violet bar in
+        # _bar_metric_row, triggered by the +inf sentinel below) instead of
+        # this caption's own "unlimited" word — keeping both said the same
+        # thing twice.
+        weekly_unlimited = status.get("minimax_weekly_status") == 3
         weekly_parts = []
-        if status.get("minimax_weekly_status") == 3:
-            weekly_parts.append("unlimited")
         if weekly_remaining is not None and weekly_total:
             weekly_parts.append(f"{weekly_remaining}/{weekly_total} left")
         weekly_reset = _format_resets(weekly_resets_at)
@@ -654,7 +678,7 @@ def _usage_metrics(status):
             (
                 "bar",
                 "WEEKLY",
-                weekly,
+                float("inf") if weekly_unlimited else weekly,
                 " · ".join(weekly_parts)
                 or ("no usage data" if weekly is None else ""),
                 "minimax_weekly_percent",
@@ -682,18 +706,63 @@ def _usage_metrics(status):
                 None,
             ),
         ]
-    tok, req = status.get("zcode_token_percent"), status.get("zcode_request_percent")
-    tok_resets = _format_resets(status.get("zcode_token_resets_at"))
+    five = status.get("zcode_five_hour_percent")
+    five_resets_at = status.get("zcode_five_hour_resets_at")
+    weekly = status.get("zcode_weekly_percent")
+    weekly_resets_at = status.get("zcode_weekly_resets_at")
+    req = status.get("zcode_request_percent")
+    req_resets_at = status.get("zcode_request_resets_at")
+
     req_left, req_total = status.get("zcode_request_remaining"), status.get("zcode_request_total")
-    req_caption = f"{req_left}/{req_total} left" if req_left is not None and req_total else _format_resets(status.get("zcode_request_resets_at"))
+    req_parts = []
+    if req_left is not None and req_total:
+        req_parts.append(f"{req_left}/{req_total} left")
+    req_reset = _format_resets(req_resets_at)
+    if req_reset:
+        req_parts.append(req_reset)
+    # "top: <tool> <n>" is the least important of the three and the longest —
+    # all three together overflow the row's width, so it only earns its place
+    # when the quota numbers themselves aren't available to show.
     top_feature, top_usage = status.get("zcode_top_feature"), status.get("zcode_top_feature_usage")
-    if top_feature and top_usage:
-        req_caption = f"{req_caption} · top: {top_feature} {top_usage}" if req_caption else f"top: {top_feature} {top_usage}"
-    return [
-        ("bar", "TOKENS", tok, tok_resets or ("no usage data" if tok is None else ""), "zcode_token_percent", status.get("zcode_token_resets_at")),
-        ("bar", "REQUESTS", req, req_caption or "", "zcode_request_percent", status.get("zcode_request_resets_at")),
-        ("bar", "CACHE HIT", status.get("cache_hit_percent"), "", "cache_hit_percent", None),
+    if top_feature and top_usage and not req_parts:
+        req_parts.append(f"top: {top_feature} {top_usage}")
+    req_caption = " · ".join(req_parts)
+
+    rows = [
+        ("bar", "5-HOUR", five,
+         _format_resets(five_resets_at) or ("no usage data" if five is None else ""),
+         "zcode_five_hour_percent", five_resets_at),
     ]
+    # The weekly token cap is only emitted by the quota endpoint for plans that
+    # actually carry one, so an absent weekly window is a real "this plan has
+    # none" — not a fetch failure worth showing an empty bar for.
+    if weekly is not None:
+        rows.append(
+            ("bar", "WEEKLY", weekly,
+             _format_resets(weekly_resets_at) or "",
+             "zcode_weekly_percent", weekly_resets_at)
+        )
+    rows.append(
+        ("bar", "TOOLS", req, req_caption or ("no usage data" if req is None else ""),
+         "zcode_request_percent", req_resets_at)
+    )
+    rows.append(
+        ("bar", "CACHE HIT", status.get("cache_hit_percent"),
+         "no session data" if status.get("cache_hit_percent") is None else "",
+         "cache_hit_percent", None)
+    )
+    return rows
+
+
+def _is_offline_status(status):
+    health = status.get("health")
+    if health is not None:
+        return health == "offline"
+    return status.get("state") in ("no session", "offline")
+
+
+def _session_slot_count(metrics):
+    return 2 if len(metrics) >= 4 else MAX_SESSION_ROWS
 
 
 def _is_offline_status(status):
@@ -808,8 +877,16 @@ def _draw_agent_panel(img, x0, status, bg=None, bg_name=None):
     y += 16 if compact else 22
     for kind, label, value, caption, metric_key, resets_at in metrics:
         if kind == "bar":
-            trend = history.recent_values(status["tool"], metric_key) if metric_key else None
-            warn = _predict_warning(status["tool"], metric_key, value, resets_at) if metric_key else None
+            # +inf (uncapped tier, e.g. MiniMax weekly unlimited) has no real
+            # trend/projection to compute against — a projection against
+            # infinity is meaningless and would render a garbled "⚠ pace →
+            # infl by reset" caption.
+            unlimited = value == float("inf")
+            trend = history.recent_values(status["tool"], metric_key) if metric_key and not unlimited else None
+            warn = (
+                _predict_warning(status["tool"], metric_key, value, resets_at)
+                if metric_key and not unlimited else None
+            )
             invert = metric_key == "cache_hit_percent"
             _bar_metric_row(draw, ix0, ix1, y, label, value, caption, trend=trend, warn=warn, invert=invert, compact=compact)
         else:

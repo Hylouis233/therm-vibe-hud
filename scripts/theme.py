@@ -6,6 +6,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 TRCC_BIN = "/Applications/TRCC.app/Contents/MacOS/TRCC"
+TRCC_HELPER_DIR = ROOT / "scripts" / "trcc-bin"
 DEVICE_KEY = "0416:5408"
 STATE_PATH = ROOT / "state.json"
 BACKGROUNDS_DIR = ROOT / "assets" / "backgrounds"
@@ -16,6 +17,13 @@ CATEGORIES = {"a": "Gallery", "b": "Tech", "c": "HUD", "d": "Light", "e": "Natur
 def _env():
     env = os.environ.copy()
     env["SSL_CERT_FILE"] = "/etc/ssl/cert.pem"
+    original_path = env.get("PATH")
+    env["PATH"] = (
+        f"{TRCC_HELPER_DIR}{os.pathsep}{original_path}"
+        if original_path
+        else str(TRCC_HELPER_DIR)
+    )
+    env["TRCC_DAEMON"] = "1"
     return env
 
 

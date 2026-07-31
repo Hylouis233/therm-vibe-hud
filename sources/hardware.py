@@ -3,8 +3,11 @@ import re
 import shutil
 import subprocess
 import time
+from pathlib import Path
 
 TRCC_BIN = "/Applications/TRCC.app/Contents/MacOS/TRCC"
+TRCC_HELPER_DIR = Path(__file__).resolve().parent.parent / "scripts" / "trcc-bin"
+TRCC_INFO_TIMEOUT_SEC = 30
 LINE_RE = re.compile(r"^\s*([\w:]+)\s+([\d.]+)\s*(\S*)")
 
 # net:total_up/down are cumulative MB counters; diff across ticks to get a
@@ -16,6 +19,13 @@ _prev_net = None  # (timestamp, total_up_mb, total_down_mb)
 def _env():
     env = os.environ.copy()
     env["SSL_CERT_FILE"] = "/etc/ssl/cert.pem"
+    original_path = env.get("PATH")
+    env["PATH"] = (
+        f"{TRCC_HELPER_DIR}{os.pathsep}{original_path}"
+        if original_path
+        else str(TRCC_HELPER_DIR)
+    )
+    env["TRCC_DAEMON"] = "1"
     return env
 
 
@@ -104,7 +114,7 @@ def read_status():
             capture_output=True,
             text=True,
             env=_env(),
-            timeout=10,
+            timeout=TRCC_INFO_TIMEOUT_SEC,
         )
     except (subprocess.SubprocessError, OSError):
         result = None
