@@ -5,7 +5,9 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-TRCC_BIN = "/Applications/TRCC.app/Contents/MacOS/TRCC"
+TRCC_BIN = os.environ.get(
+    "THERM_VIBE_TRCC_BIN", "/Applications/TRCC.app/Contents/MacOS/TRCC"
+)
 TRCC_HELPER_DIR = ROOT / "scripts" / "trcc-bin"
 DEVICE_KEY = "0416:5408"
 STATE_PATH = ROOT / "state.json"
@@ -18,10 +20,11 @@ def _env():
     env = os.environ.copy()
     env["SSL_CERT_FILE"] = "/etc/ssl/cert.pem"
     original_path = env.get("PATH")
+    trcc_paths = os.pathsep.join((str(Path(TRCC_BIN).parent), str(TRCC_HELPER_DIR)))
     env["PATH"] = (
-        f"{TRCC_HELPER_DIR}{os.pathsep}{original_path}"
+        f"{trcc_paths}{os.pathsep}{original_path}"
         if original_path
-        else str(TRCC_HELPER_DIR)
+        else trcc_paths
     )
     env["TRCC_DAEMON"] = "1"
     return env

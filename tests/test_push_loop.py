@@ -14,6 +14,23 @@ class _FakeImage:
 
 
 class PushLoopTests(unittest.TestCase):
+    def setUp(self):
+        self._display_sleep_patch = mock.patch.object(
+            push_loop, "_display_is_asleep", return_value=False
+        )
+        self._display_sleep_patch.start()
+        push_loop._panel_power_checked = True
+        push_loop._screen_sleep_event.clear()
+        push_loop._daemon_ready_event.set()
+        push_loop._screen_blanked = False
+        push_loop._send_fail_streak = 0
+        push_loop._last_daemon_health_check_at = time.monotonic()
+
+    def tearDown(self):
+        push_loop._screen_sleep_event.clear()
+        push_loop._daemon_ready_event.clear()
+        self._display_sleep_patch.stop()
+
     def _cache_state_patches(self):
         return (
             mock.patch.object(push_loop, "_reader_caches", {}, create=True),
@@ -262,6 +279,101 @@ class PushLoopTests(unittest.TestCase):
         send_call = next(call for call in calls if "send-image" in call[0])
         self.assertEqual(send_call[1]["env"]["TRCC_DAEMON"], "1")
         self.assertEqual(send_call[1]["timeout"], 30)
+
+    def test_display_sleep_takes_precedence_over_idle_fallback(self):
+        with mock.patch.object(push_loop, "_display_is_asleep", return_value=True):
+            with mock.patch.object(push_loop, "_human_idle_sec") as idle_mock:
+                self.assertEqual(push_loop._screen_sleep_reason(), "main display asleep")
+        idle_mock.assert_not_called()
+
+    def test_suspend_panel_blanks_kills_and_suspends_only_once(self):
+        completed = subprocess.CompletedProcess([], 0, "suspended=true", "")
+        with ExitStack() as stack:
+            run_trcc = stack.enter_context(
+                mock.patch.object(push_loop, "_run_trcc", return_value=completed)
+            )
+            kill_daemon = stack.enter_context(
+                mock.patch.object(push_loop, "_kill_trcc_daemon")
+            )
+            power = stack.enter_context(
+                mock.patch.object(
+                    push_loop, "_run_power_helper", return_value=completed
+                )
+            )
+            push_loop._suspend_panel("main display asleep")
+            push_loop._suspend_panel("main display asleep")
+
+        run_trcc.assert_called_once_with("display", "sleep", push_loop.DEVICE_KEY)
+        kill_daemon.assert_called_once_with()
+        power.assert_called_once_with("suspend")
+        self.assertTrue(push_loop._screen_blanked)
+        self.assertTrue(push_loop._screen_sleep_event.is_set())
+
+    def test_resume_panel_recovers_state_left_by_previous_process(self):
+        completed = subprocess.CompletedProcess([], 0, "suspended=false", "")
+        push_loop._screen_blanked = True
+        push_loop._screen_sleep_event.set()
+        with mock.patch.object(
+            push_loop, "_panel_status_suspended", return_value=True
+        ):
+            with mock.patch.object(
+                push_loop, "_run_power_helper", return_value=completed
+            ) as power:
+                self.assertTrue(push_loop._resume_panel_if_needed())
+
+        power.assert_called_once_with("resume")
+        self.assertFalse(push_loop._screen_blanked)
+        self.assertFalse(push_loop._screen_sleep_event.is_set())
+        self.assertTrue(push_loop._panel_power_checked)
+
+    def test_daemon_scan_ignores_shells_that_only_mention_trcc_daemon(self):
+        listing = "\n".join(
+            [
+                " 123 400000 /Applications/TRCC.app/Contents/MacOS/TRCC daemon",
+                " 456 1000 /bin/zsh -c pgrep -f 'TRCC daemon'",
+                " 789 2000 /Applications/TRCC.app/Contents/MacOS/TRCC status",
+            ]
+        )
+        result = subprocess.CompletedProcess([], 0, listing, "")
+        with mock.patch.object(push_loop.subprocess, "run", return_value=result):
+            self.assertEqual(push_loop._trcc_daemons(), [(123, 400000)])
+
+    def test_daemon_scan_accepts_configured_python_module_runtime(self):
+        trcc_bin = "/opt/Therm Vibe/trcc-venv/bin/trcc"
+        listing = (
+            " 321 120000 /opt/Therm Vibe/trcc-venv/bin/python3.12 "
+            "-m trcc daemon"
+        )
+        result = subprocess.CompletedProcess([], 0, listing, "")
+        with mock.patch.object(push_loop, "TRCC_BIN", trcc_bin):
+            with mock.patch.object(push_loop.subprocess, "run", return_value=result):
+                self.assertEqual(push_loop._trcc_daemons(), [(321, 120000)])
+
+    def test_daemon_scan_accepts_configured_console_script_runtime(self):
+        trcc_bin = "/opt/Therm Vibe/trcc-venv/bin/trcc"
+        listing = (
+            " 654 130000 /opt/Therm Vibe/trcc-venv/bin/python "
+            "/opt/Therm Vibe/trcc-venv/bin/trcc daemon"
+        )
+        result = subprocess.CompletedProcess([], 0, listing, "")
+        with mock.patch.object(push_loop, "TRCC_BIN", trcc_bin):
+            with mock.patch.object(push_loop.subprocess, "run", return_value=result):
+                self.assertEqual(push_loop._trcc_daemons(), [(654, 130000)])
+
+    def test_memory_guard_recycles_daemon_at_rss_limit(self):
+        push_loop._last_daemon_health_check_at = 0
+        with mock.patch.object(
+            push_loop,
+            "_trcc_daemons",
+            return_value=[(123, push_loop.DAEMON_MAX_RSS_MB * 1024)],
+        ):
+            with mock.patch.object(
+                push_loop, "_maybe_restart_daemon", return_value=True
+            ) as restart:
+                self.assertTrue(push_loop._maybe_recycle_daemon())
+
+        restart.assert_called_once()
+        self.assertIn("RSS", restart.call_args.args[0])
 
 
 if __name__ == "__main__":

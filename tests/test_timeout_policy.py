@@ -24,11 +24,10 @@ class TimeoutPolicyTests(unittest.TestCase):
         self.assertEqual(push_loop._env()["TRCC_DAEMON"], "1")
         self.assertEqual(hardware._env()["TRCC_DAEMON"], "1")
         self.assertEqual(theme._env()["TRCC_DAEMON"], "1")
-        helper_dirs = {
-            Path(module._env()["PATH"].split(os.pathsep, 1)[0])
-            for module in (push_loop, hardware, theme)
-        }
-        self.assertEqual(helper_dirs, {push_loop.TRCC_HELPER_DIR})
+        for module in (push_loop, hardware, theme):
+            path_entries = module._env()["PATH"].split(os.pathsep)
+            self.assertEqual(Path(path_entries[0]), Path(module.TRCC_BIN).parent)
+            self.assertEqual(Path(path_entries[1]), push_loop.TRCC_HELPER_DIR)
         self.assertTrue(os.access(push_loop.TRCC_HELPER_DIR / "trcc", os.X_OK))
 
 

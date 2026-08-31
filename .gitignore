@@ -8,3 +8,4 @@ usage_history.sqlite3
 pricing_cache.json
 codex_quota_anchor.json
 state.json
+scripts/trcc-usb-power

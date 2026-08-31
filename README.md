@@ -35,6 +35,9 @@ local SQLite history (`sources/history.py`).
   are macOS-only.
 - [TRCC.app](https://www.trcc-app.com/) installed at
   `/Applications/TRCC.app`, the vendor CLI used to drive the panel.
+  Set `THERM_VIBE_TRCC_BIN` to another compatible `trcc` executable when
+  testing a patched/upstream runtime; the push loop, hardware reader, theme
+  commands, daemon scanner, and self-heal all honor the same override.
 - A TRCC-supported panel. `DEVICE_KEY = "0416:5408"` in
   `scripts/push_loop.py` and `scripts/theme.py` is this panel's
   vendor:product ID — change it if yours differs.
@@ -47,6 +50,9 @@ python3 -m venv .venv
 source .venv/bin/activate
 pip install pillow
 
+# Build the macOS helper that fully suspends/resumes the target USB panel.
+./scripts/build_usb_power.sh
+
 # render one frame to preview.png without touching the device
 python3 renderer/render.py
 
@@ -56,6 +62,12 @@ python3 scripts/push_loop.py
 
 For always-on operation, run it under a launchd agent (`KeepAlive` +
 `RunAtLoad`) rather than a foreground shell.
+
+The push loop follows the real macOS display-sleep state (with the existing
+15-minute HID-idle fallback). It sends one black frame, stops TRCC, and uses
+IOKit to suspend only USB device `0416:5408`; wake resumes that device before
+frames restart. If the helper is not built, the loop remains functional but
+falls back to a black frame, whose LCD backlight may remain visible.
 
 ## How it reads data
 

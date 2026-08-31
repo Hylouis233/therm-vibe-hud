@@ -5,7 +5,9 @@ import subprocess
 import time
 from pathlib import Path
 
-TRCC_BIN = "/Applications/TRCC.app/Contents/MacOS/TRCC"
+TRCC_BIN = os.environ.get(
+    "THERM_VIBE_TRCC_BIN", "/Applications/TRCC.app/Contents/MacOS/TRCC"
+)
 TRCC_HELPER_DIR = Path(__file__).resolve().parent.parent / "scripts" / "trcc-bin"
 TRCC_INFO_TIMEOUT_SEC = 30
 LINE_RE = re.compile(r"^\s*([\w:]+)\s+([\d.]+)\s*(\S*)")
@@ -20,10 +22,11 @@ def _env():
     env = os.environ.copy()
     env["SSL_CERT_FILE"] = "/etc/ssl/cert.pem"
     original_path = env.get("PATH")
+    trcc_paths = os.pathsep.join((str(Path(TRCC_BIN).parent), str(TRCC_HELPER_DIR)))
     env["PATH"] = (
-        f"{TRCC_HELPER_DIR}{os.pathsep}{original_path}"
+        f"{trcc_paths}{os.pathsep}{original_path}"
         if original_path
-        else str(TRCC_HELPER_DIR)
+        else trcc_paths
     )
     env["TRCC_DAEMON"] = "1"
     return env
@@ -53,10 +56,14 @@ def _swap_usage_gb():
 
 
 def _mem_usage_gb():
-    """TRCC's own `memory:used` sensor only counts a narrow subset of pages
-    (~9.6GB when the system was actually at ~23GB used) — compute the same
-    active+inactive+wired+compressed total macOS's own `top`/Activity Monitor
-    report instead, straight from vm_stat + hw.memsize."""
+    """Return an Activity Monitor-style memory total from ``vm_stat``.
+
+    ``active + inactive`` is not an application-memory figure on macOS:
+    inactive includes a large file-backed cache that is immediately
+    reclaimable. Counting it made a healthy 96 GB host appear 88-94% full.
+    Anonymous + wired + the compressor's physical pages tracks memory that is
+    actually resident/non-reclaimable while leaving cached files available.
+    """
     try:
         vm_out = subprocess.run(["vm_stat"], capture_output=True, text=True, timeout=5).stdout
     except (subprocess.SubprocessError, OSError):
@@ -74,11 +81,14 @@ def _mem_usage_gb():
         if value.isdigit():
             pages[label.strip()] = int(value)
 
-    active = pages.get("Pages active", 0)
-    inactive = pages.get("Pages inactive", 0)
+    anonymous = pages.get("Anonymous pages")
     wired = pages.get("Pages wired down", 0)
     compressor = pages.get("Pages occupied by compressor", 0)
-    used_gb = (active + inactive + wired + compressor) * page_size / 1024**3
+    if anonymous is None:
+        # Older vm_stat variants may omit the anonymous counter. Active pages
+        # are a conservative fallback and still avoid inactive file cache.
+        anonymous = pages.get("Pages active", 0)
+    used_gb = (anonymous + wired + compressor) * page_size / 1024**3
 
     try:
         total_bytes = int(subprocess.run(
