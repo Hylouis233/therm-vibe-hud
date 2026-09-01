@@ -80,12 +80,27 @@ class GrokStatusTests(unittest.TestCase):
                 with mock.patch.object(grok, "SESSIONS_DIR", session_root):
                     with mock.patch.object(grok, "_bot_process_running", return_value=True):
                         with mock.patch.object(grok, "_bot_credentials", return_value=None):
-                            status = grok.read_status()
+                            with mock.patch.object(
+                                grok,
+                                "_latest_cli_billing",
+                                return_value={
+                                    "percent": 17.0,
+                                    "resets_at": 1_893_542_400.0,
+                                    "plan": "SuperGrok Heavy",
+                                    "on_demand_cap": 0.0,
+                                    "on_demand_used": 0.0,
+                                    "prepaid_balance": 0.0,
+                                    "updated_at": 1_893_456_000.0,
+                                },
+                            ):
+                                status = grok.read_status()
 
         self.assertEqual(status["tool"], "Grok")
         self.assertEqual(status["state"], "running")
         self.assertEqual(status["identity"], "grok-4.6")
         self.assertEqual(status["context_percent"], 42)
+        self.assertEqual(status["grok_cli_percent"], 17.0)
+        self.assertEqual(status["grok_cli_resets_at"], 1_893_542_400.0)
         self.assertEqual(status["grok_sessions_24h"], 1)
         self.assertEqual(status["grok_tokens_24h"], 105_000)
         self.assertEqual(status["cache_hit_percent"], 80.0)
@@ -120,6 +135,60 @@ class GrokStatusTests(unittest.TestCase):
         self.assertEqual(usage["period_percent"], 3.0)
         self.assertEqual(usage["period_resets_at"], 1_893_456_000.0)
         self.assertTrue(usage["running"])
+
+    def test_latest_cli_billing_reads_official_log_record(self):
+        with tempfile.TemporaryDirectory() as raw_root:
+            log_path = Path(raw_root) / "unified.jsonl"
+            old = {"msg": "billing: fetched credits config", "ctx": {"config": {"creditUsagePercent": 16}}}
+            latest = {
+                "ts": "2030-01-01T00:00:00Z",
+                "msg": "billing: fetched credits config",
+                "ctx": {
+                    "config": {
+                        "creditUsagePercent": 17,
+                        "currentPeriod": {"end": "2030-01-02T00:00:00Z"},
+                        "onDemandCap": {"val": 0},
+                        "onDemandUsed": {"val": 0},
+                        "prepaidBalance": {"val": 0},
+                        "subscriptionTier": "SuperGrok Heavy",
+                    }
+                },
+            }
+            log_path.write_text(
+                json.dumps(old) + "\n" + json.dumps(latest) + "\n", encoding="utf-8"
+            )
+            with mock.patch.object(grok, "UNIFIED_LOG_PATH", log_path):
+                billing = grok._latest_cli_billing()
+
+        self.assertEqual(billing["percent"], 17.0)
+        self.assertEqual(billing["plan"], "SuperGrok Heavy")
+        self.assertEqual(billing["resets_at"], 1893542400.0)
+        self.assertEqual(billing["updated_at"], 1893456000.0)
+
+    def test_usage_totals_are_cached_until_the_updates_file_changes(self):
+        with tempfile.TemporaryDirectory() as raw_root:
+            path = Path(raw_root) / "updates.jsonl"
+            event = {
+                "params": {
+                    "update": {
+                        "usage": {
+                            "inputTokens": 10,
+                            "outputTokens": 2,
+                            "totalTokens": 12,
+                            "cachedReadTokens": 8,
+                            "modelCalls": 1,
+                        }
+                    }
+                }
+            }
+            path.write_text(json.dumps(event) + "\n", encoding="utf-8")
+            first = grok._usage_totals_from_updates(path)
+            path.write_text(json.dumps(event) + "\n", encoding="utf-8")
+            os.utime(path, ns=(0, 0))
+            second = grok._usage_totals_from_updates(path)
+
+        self.assertEqual(first["totalTokens"], 12)
+        self.assertIsNot(first, second)
 
     def test_live_failure_does_not_leak_credentials_or_make_cli_offline(self):
         with mock.patch.object(grok, "_bot_process_running", return_value=False):

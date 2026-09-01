@@ -707,6 +707,7 @@ def _usage_metrics(status):
             ),
         ]
     if tool == "Grok":
+        cli_resets_at = status.get("grok_cli_resets_at")
         context = status.get("context_percent")
         context_tokens = status.get("context_tokens")
         context_window = status.get("context_window")
@@ -717,8 +718,16 @@ def _usage_metrics(status):
                 f"{_human_count(context_window)} tok"
             )
         bot_resets_at = status.get("grok_bot_resets_at")
-        period_resets_at = status.get("grok_bot_period_resets_at")
         return [
+            (
+                "bar",
+                "CLI QUOTA",
+                status.get("grok_cli_percent"),
+                _format_resets(cli_resets_at)
+                or ("no billing data" if status.get("grok_cli_percent") is None else ""),
+                "grok_cli_percent",
+                cli_resets_at,
+            ),
             (
                 "bar",
                 "CLI CTX",
@@ -729,21 +738,12 @@ def _usage_metrics(status):
             ),
             (
                 "bar",
-                "BOT INC",
+                "BOT QUOTA",
                 status.get("grok_bot_percent"),
                 _format_resets(bot_resets_at)
                 or ("no usage data" if status.get("grok_bot_percent") is None else ""),
                 "grok_bot_percent",
                 bot_resets_at,
-            ),
-            (
-                "bar",
-                "BOT TOT",
-                status.get("grok_bot_period_percent"),
-                _format_resets(period_resets_at)
-                or ("no usage data" if status.get("grok_bot_period_percent") is None else ""),
-                "grok_bot_period_percent",
-                period_resets_at,
             ),
             (
                 "bar",

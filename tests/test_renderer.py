@@ -227,6 +227,8 @@ class SixPanelLayoutTests(unittest.TestCase):
             {
                 "tool": "Grok",
                 "context_percent": 61.0,
+                "grok_cli_percent": 17.0,
+                "grok_cli_resets_at": 1_893_456_000,
                 "context_tokens": 309_830,
                 "context_window": 500_000,
                 "grok_bot_percent": 1.748973,
@@ -239,18 +241,18 @@ class SixPanelLayoutTests(unittest.TestCase):
 
         self.assertEqual(
             [row[1] for row in rows],
-            ["CLI CTX", "BOT INC", "BOT TOT", "CACHE HIT"],
+            ["CLI QUOTA", "CLI CTX", "BOT QUOTA", "CACHE HIT"],
         )
         self.assertEqual(
             [row[4] for row in rows],
             [
+                "grok_cli_percent",
                 "context_percent",
                 "grok_bot_percent",
-                "grok_bot_period_percent",
                 "cache_hit_percent",
             ],
         )
-        self.assertIn("309.8K / 500.0K tok", rows[0][3])
+        self.assertIn("309.8K / 500.0K tok", rows[1][3])
 
     def test_four_usage_rows_reserve_two_session_slots(self):
         metrics = renderer._usage_metrics({

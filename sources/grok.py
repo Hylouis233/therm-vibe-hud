@@ -16,6 +16,7 @@ from urllib.parse import quote
 GROK_HOME = Path.home() / ".grok"
 ACTIVE_SESSIONS_PATH = GROK_HOME / "active_sessions.json"
 SESSIONS_DIR = GROK_HOME / "sessions"
+UNIFIED_LOG_PATH = GROK_HOME / "logs" / "unified.jsonl"
 
 GROK_BOT_APP_SUPPORT = Path.home() / "Library" / "Application Support" / "Grok Bot"
 GROK_BOT_SECRETS_PATH = GROK_BOT_APP_SUPPORT / "sand-secrets.json"
@@ -34,6 +35,7 @@ _cli_cache = None
 _cli_cache_at = 0.0
 _bot_cache = None
 _bot_cache_at = 0.0
+_usage_cache = {}
 
 _COMMON_CRYPTO = None
 if os.uname().sysname == "Darwin":
@@ -138,10 +140,25 @@ def _empty_usage_totals():
 
 
 def _usage_totals_from_updates(path):
+    try:
+        stat = path.stat()
+        cache_key = (stat.st_mtime_ns, stat.st_size)
+    except OSError:
+        return _empty_usage_totals()
+    cached = _usage_cache.get(path)
+    if cached is not None and cached[0] == cache_key:
+        return cached[1]
+
     totals = _empty_usage_totals()
     try:
         with path.open("r", encoding="utf-8", errors="replace") as handle:
             for line in handle:
+                # Session updates can carry very large encrypted assistant
+                # blobs.  JSON-decoding those lines allocates hundreds of MiB
+                # across a day of sessions even though usage records are small;
+                # pre-filter the textual key before parsing.
+                if '"usage"' not in line:
+                    continue
                 try:
                     event = json.loads(line)
                     usage = event["params"]["update"]["usage"]
@@ -155,7 +172,49 @@ def _usage_totals_from_updates(path):
                         totals[key] += value
     except OSError:
         pass
+    _usage_cache[path] = (cache_key, totals)
     return totals
+
+
+def _latest_cli_billing():
+    """Read the newest official billing config Grok CLI appends to its log.
+
+    The CLI refreshes this record when it starts and after usage-changing
+    turns. Reading its latest append is authoritative without invoking a model
+    or reconstructing an undocumented HTTP endpoint.
+    """
+    try:
+        size = UNIFIED_LOG_PATH.stat().st_size
+        with UNIFIED_LOG_PATH.open("rb") as handle:
+            handle.seek(max(0, size - 1_048_576), os.SEEK_SET)
+            tail = handle.read().decode("utf-8", errors="replace")
+    except OSError:
+        return None
+
+    for line in reversed(tail.splitlines()):
+        try:
+            event = json.loads(line)
+            if event.get("msg") != "billing: fetched credits config":
+                continue
+            config = event["ctx"]["config"]
+            percent = _number(config.get("creditUsagePercent"))
+            current_period = config.get("currentPeriod") or {}
+            resets_at = _parse_time(current_period.get("end"))
+            on_demand_cap = _number((config.get("onDemandCap") or {}).get("val"))
+            on_demand_used = _number((config.get("onDemandUsed") or {}).get("val"))
+            prepaid_balance = _number((config.get("prepaidBalance") or {}).get("val"))
+            return {
+                "percent": percent,
+                "resets_at": resets_at,
+                "plan": config.get("subscriptionTier"),
+                "on_demand_cap": on_demand_cap,
+                "on_demand_used": on_demand_used,
+                "prepaid_balance": prepaid_balance,
+                "updated_at": _parse_time(event.get("ts")),
+            }
+        except (ValueError, KeyError, TypeError):
+            continue
+    return None
 
 
 def _cli_usage(now=None):
@@ -214,6 +273,7 @@ def _cli_usage(now=None):
         "cached_tokens_24h": totals["cachedReadTokens"],
         "model_calls_24h": totals["modelCalls"],
         "model": models[0] if models else None,
+        "billing": _latest_cli_billing(),
     }
     with _cache_lock:
         _cli_cache = result
@@ -407,18 +467,25 @@ def read_status():
         )
 
     active_count = len(cli["active"]) + int(bot["running"])
+    billing = cli.get("billing") or {}
     return {
         "tool": "Grok",
         "display_name": "Grok",
         "state": "running" if active_count else "no session",
         "identity": cli.get("model"),
-        "plan_type": bot.get("plan"),
+        "plan_type": billing.get("plan") or bot.get("plan"),
         "active_count": active_count,
         "sessions": sessions,
         "context_percent": cli.get("context_percent"),
         "context_tokens": cli.get("context_tokens"),
         "context_window": cli.get("context_window"),
         "cache_hit_percent": cli.get("cache_hit_percent"),
+        "grok_cli_percent": billing.get("percent"),
+        "grok_cli_resets_at": billing.get("resets_at"),
+        "grok_cli_on_demand_used": billing.get("on_demand_used"),
+        "grok_cli_on_demand_cap": billing.get("on_demand_cap"),
+        "grok_cli_prepaid_balance": billing.get("prepaid_balance"),
+        "grok_cli_quota_updated_at": billing.get("updated_at"),
         "grok_bot_percent": bot.get("percent"),
         "grok_bot_resets_at": bot.get("resets_at"),
         "grok_bot_period_percent": bot.get("period_percent"),

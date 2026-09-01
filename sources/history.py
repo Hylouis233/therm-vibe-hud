@@ -17,7 +17,7 @@ _AGENT_METRICS = (
     "zcode_request_percent",
     "kimi_monthly_percent", "kimi_five_hour_percent", "kimi_weekly_percent",
     "minimax_five_hour_percent", "minimax_weekly_percent",
-    "grok_bot_percent", "grok_bot_period_percent",
+    "grok_cli_percent", "grok_bot_percent",
 )
 _HW_METRICS = ("cpu_usage", "mem_percent", "swap_used_gb")
 

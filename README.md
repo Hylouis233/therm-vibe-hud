@@ -24,8 +24,10 @@ never fabricated placeholders.
   and weekly limits, plus context and cache metrics from matching local
   sessions.
 - **Grok** — one combined vertical card for Grok CLI and Grok Bot: live CLI
-  sessions, maximum context use, 24-hour token/tool-call totals, cache-hit
-  rate, and Grok Bot's live included/period usage and reset time.
+  quota/context, 24-hour token/tool-call totals, cache-hit rate, and Grok
+  Bot's live quota and reset time. CLI quota comes from Grok's own billing
+  record in `~/.grok/logs/unified.jsonl`; Bot quota comes from its dashboard
+  usage API.
 - **Hardware** — CPU/memory/disk usage and temperature, fan RPM,
   network throughput, uptime, swap.
 
