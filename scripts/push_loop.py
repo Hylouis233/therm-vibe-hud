@@ -13,7 +13,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from renderer.render import render  # noqa: E402
-from sources import claude_code, codex_cli, kimi, minimax, zcode, hardware, history  # noqa: E402
+from sources import claude_code, codex_cli, grok, kimi, minimax, zcode, hardware, history  # noqa: E402
 from sources.background_cache import BackgroundCache  # noqa: E402
 from scripts import theme  # noqa: E402
 
@@ -63,6 +63,7 @@ READERS = (
     kimi.read_status,
     zcode.read_status,
     minimax.read_status,
+    grok.read_status,
 )
 READER_NAMES = (
     "Claude Code",
@@ -70,6 +71,7 @@ READER_NAMES = (
     "Kimi Code",
     "zcode",
     "MiniMax",
+    "Grok",
 )
 BACKGROUNDS_DIR = ROOT / "assets" / "backgrounds"
 

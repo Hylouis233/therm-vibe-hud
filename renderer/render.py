@@ -23,7 +23,7 @@ CARD_ALPHA_ON_BG = round(255 * 0.20)
 # tint out toward white and kill text contrast; darker regions (below the
 # cap) pass through unclamped so panels still visibly differ from each other.
 BG_TINT_MAX_CHANNEL = 118
-PANEL_COUNT = 6
+PANEL_COUNT = 7
 PANEL_W = CANVAS_W // PANEL_COUNT
 CARD_MARGIN = 14
 PAD = 16
@@ -706,6 +706,54 @@ def _usage_metrics(status):
                 None,
             ),
         ]
+    if tool == "Grok":
+        context = status.get("context_percent")
+        context_tokens = status.get("context_tokens")
+        context_window = status.get("context_window")
+        context_caption = ""
+        if context_tokens is not None and context_window:
+            context_caption = (
+                f"{_human_count(context_tokens)} / "
+                f"{_human_count(context_window)} tok"
+            )
+        bot_resets_at = status.get("grok_bot_resets_at")
+        period_resets_at = status.get("grok_bot_period_resets_at")
+        return [
+            (
+                "bar",
+                "CLI CTX",
+                context,
+                context_caption or ("no active session" if context is None else ""),
+                "context_percent",
+                None,
+            ),
+            (
+                "bar",
+                "BOT INC",
+                status.get("grok_bot_percent"),
+                _format_resets(bot_resets_at)
+                or ("no usage data" if status.get("grok_bot_percent") is None else ""),
+                "grok_bot_percent",
+                bot_resets_at,
+            ),
+            (
+                "bar",
+                "BOT TOT",
+                status.get("grok_bot_period_percent"),
+                _format_resets(period_resets_at)
+                or ("no usage data" if status.get("grok_bot_period_percent") is None else ""),
+                "grok_bot_period_percent",
+                period_resets_at,
+            ),
+            (
+                "bar",
+                "CACHE HIT",
+                status.get("cache_hit_percent"),
+                "24H CLI" if status.get("cache_hit_percent") is not None else "no session data",
+                "cache_hit_percent",
+                None,
+            ),
+        ]
     five = status.get("zcode_five_hour_percent")
     five_resets_at = status.get("zcode_five_hour_resets_at")
     weekly = status.get("zcode_weekly_percent")
@@ -912,7 +960,22 @@ def _draw_agent_panel(img, x0, status, bg=None, bg_name=None):
             segments.append(f"${status['credits_balance']:,.0f} credits")
         lines, footer_font, line_h = _wrap_footer_lines(draw, segments, ix1 - ix0)
         _draw_wrapped_footer(draw, lines, ix0, y + 4, footer_bottom_limit, footer_font, FG_FAINT,
-                              line_h=line_h, min_top=footer_min_top)
+                line_h=line_h, min_top=footer_min_top)
+    elif status["tool"] == "Grok":
+        sessions_24h = status.get("grok_sessions_24h")
+        tokens_24h = status.get("grok_tokens_24h")
+        model_calls = status.get("grok_model_calls_24h")
+        if sessions_24h or tokens_24h is not None:
+            segments = [f"{_human_count(sessions_24h)} sessions 24h"]
+            if tokens_24h is not None:
+                segments.append(f"{_human_count(tokens_24h)} tok 24h")
+            if model_calls is not None:
+                segments.append(f"{_human_count(model_calls)} calls")
+            lines, footer_font, line_h = _wrap_footer_lines(draw, segments, ix1 - ix0)
+            _draw_wrapped_footer(
+                draw, lines, ix0, y + 4, footer_bottom_limit, footer_font, FG_FAINT,
+                line_h=line_h, min_top=footer_min_top,
+            )
     elif status["tool"] == "zcode":
         sessions_today = status.get("sessions_today")
         session_tokens = status.get("session_tokens")
@@ -1022,7 +1085,7 @@ if __name__ == "__main__":
     import sys
 
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-    from sources import claude_code, codex_cli, kimi, minimax, zcode, hardware
+    from sources import claude_code, codex_cli, grok, kimi, minimax, zcode, hardware
 
     background = sys.argv[1] if len(sys.argv) > 1 else None
     statuses = [
@@ -1031,6 +1094,7 @@ if __name__ == "__main__":
         kimi.read_status(),
         zcode.read_status(),
         minimax.read_status(),
+        grok.read_status(),
     ]
     hw = hardware.read_status()
     out = render(statuses, hw, background=background)

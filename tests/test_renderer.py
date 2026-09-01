@@ -15,8 +15,8 @@ class SixPanelLayoutTests(unittest.TestCase):
         self.assertTrue(renderer._is_offline_status({"state": "no session"}))
 
     def test_layout_reserves_five_agents_and_hardware(self):
-        self.assertEqual(renderer.PANEL_COUNT, 6)
-        self.assertEqual(renderer.PANEL_W, renderer.CANVAS_W // 6)
+        self.assertEqual(renderer.PANEL_COUNT, 7)
+        self.assertEqual(renderer.PANEL_W, renderer.CANVAS_W // 7)
 
     def test_background_card_opacity_is_twenty_percent(self):
         self.assertEqual(renderer.CARD_ALPHA_ON_BG, round(255 * 0.20))
@@ -222,6 +222,36 @@ class SixPanelLayoutTests(unittest.TestCase):
 
         self.assertNotIn("WEEKLY", [row[1] for row in rows])
 
+    def test_grok_combines_cli_and_bot_usage_in_one_panel(self):
+        rows = renderer._usage_metrics(
+            {
+                "tool": "Grok",
+                "context_percent": 61.0,
+                "context_tokens": 309_830,
+                "context_window": 500_000,
+                "grok_bot_percent": 1.748973,
+                "grok_bot_resets_at": 1_893_456_000,
+                "grok_bot_period_percent": 3.0,
+                "grok_bot_period_resets_at": 1_893_456_000,
+                "cache_hit_percent": 92.8,
+            }
+        )
+
+        self.assertEqual(
+            [row[1] for row in rows],
+            ["CLI CTX", "BOT INC", "BOT TOT", "CACHE HIT"],
+        )
+        self.assertEqual(
+            [row[4] for row in rows],
+            [
+                "context_percent",
+                "grok_bot_percent",
+                "grok_bot_period_percent",
+                "cache_hit_percent",
+            ],
+        )
+        self.assertIn("309.8K / 500.0K tok", rows[0][3])
+
     def test_four_usage_rows_reserve_two_session_slots(self):
         metrics = renderer._usage_metrics({
             "tool": "MiniMax",
@@ -252,7 +282,7 @@ class SixPanelLayoutTests(unittest.TestCase):
 
         self.assertEqual(side[2]["value"], "0 GB")
 
-    def test_six_panel_render_keeps_expected_canvas_size(self):
+    def test_seven_panel_render_keeps_expected_canvas_size(self):
         statuses = [
             {
                 "tool": tool,
@@ -260,7 +290,7 @@ class SixPanelLayoutTests(unittest.TestCase):
                 "sessions": [],
                 "active_count": 0,
             }
-            for tool in ("Claude Code", "Codex", "Kimi Code", "zcode", "MiniMax")
+            for tool in ("Claude Code", "Codex", "Kimi Code", "zcode", "MiniMax", "Grok")
         ]
         hw = {
             "cpu_temp": None,
@@ -285,7 +315,7 @@ class SixPanelLayoutTests(unittest.TestCase):
 
         self.assertEqual(image.size, (renderer.CANVAS_W, renderer.CANVAS_H))
 
-    def test_six_panel_render_with_minimax_unlimited_weekly(self):
+    def test_seven_panel_render_with_minimax_unlimited_weekly(self):
         statuses = [
             {
                 "tool": tool,
@@ -293,7 +323,7 @@ class SixPanelLayoutTests(unittest.TestCase):
                 "sessions": [],
                 "active_count": 0,
             }
-            for tool in ("Claude Code", "Codex", "Kimi Code", "zcode")
+            for tool in ("Claude Code", "Codex", "Kimi Code", "zcode", "Grok")
         ]
         statuses.append({
             "tool": "MiniMax",

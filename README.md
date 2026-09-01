@@ -2,8 +2,9 @@
 
 A CodexBar-inspired external LCD dashboard for a TRCC-controlled Winbond
 Trofeo Vision 9.16 panel (1920×462). It shows live session, subscription,
-and quota status for Claude Code, Codex, Kimi Code, GLM, and MiniMax
-alongside a hardware monitor — all from real, locally available data,
+and quota status for Claude Code, Codex, Kimi Code, GLM, MiniMax, Grok CLI,
+and Grok Bot alongside a hardware monitor — all from real, locally available
+data,
 never fabricated placeholders.
 
 ## Panels
@@ -22,6 +23,9 @@ never fabricated placeholders.
 - **MiniMax** — MiniMax Code desktop state, Token Plan tier, five-hour
   and weekly limits, plus context and cache metrics from matching local
   sessions.
+- **Grok** — one combined vertical card for Grok CLI and Grok Bot: live CLI
+  sessions, maximum context use, 24-hour token/tool-call totals, cache-hit
+  rate, and Grok Bot's live included/period usage and reset time.
 - **Hardware** — CPU/memory/disk usage and temperature, fan RPM,
   network throughput, uptime, swap.
 
@@ -95,6 +99,11 @@ repository:
 - `sources/minimax.py` reads matching Codex/Claude-format local sessions,
   MiniMax Code desktop state, and the official Token Plan remaining
   endpoint using credentials already managed by the installed client.
+- `sources/grok.py` reads Grok CLI's local session/signals files. For Grok
+  Bot it decrypts only the active access token and machine id from the
+  app's macOS SafeStorage-backed store in memory, calls the same read-only
+  dashboard usage endpoints as the app's own usage page, and never reads,
+  writes, logs, or commits the refresh token.
 - `sources/hardware.py` shells out to `vm_stat`, `sysctl`, and TRCC's
   own `system info` command.
 - `sources/pricing.py` fetches the public [models.dev](https://models.dev)
