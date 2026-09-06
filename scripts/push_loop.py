@@ -55,7 +55,14 @@ HARDWARE_POLL_INTERVAL_SEC = 2
 # "thinking" while the human has walked away, which previously reset this
 # timer every tick and meant the screen never blanked during a long session.
 SCREEN_OFF_IDLE_SEC = 15 * 60
+# Once the panel is USB-suspended, poll slower so we do not poke IOKit every
+# frame tick. Must stay well under SCREEN_OFF_IDLE_SEC.
+SLEEP_POLL_SEC = 5.0
+# Re-apply USB suspend if macOS or a respawned TRCC daemon woke the port.
+USB_SUSPEND_REASSERT_SEC = 10.0
 HID_IDLE_RE = re.compile(rb'"HIDIdleTime"\s*=\s*(\d+)')
+_CG_EVENT_SOURCE_STATE_HID_SYSTEM = 1
+_CG_ANY_INPUT_EVENT_TYPE = 0xFFFFFFFF
 
 READERS = (
     claude_code.read_status,
@@ -89,6 +96,7 @@ _send_fail_streak = 0
 _last_daemon_restart_at = 0.0
 _last_daemon_health_check_at = 0.0
 _panel_power_checked = False
+_last_usb_suspend_at = 0.0
 
 try:
     _core_graphics = ctypes.CDLL(
@@ -100,8 +108,18 @@ try:
     _cg_display_is_asleep.argtypes = [ctypes.c_uint32]
     _cg_display_is_asleep.restype = ctypes.c_bool
 except (AttributeError, OSError):
+    _core_graphics = None
     _cg_main_display_id = None
     _cg_display_is_asleep = None
+
+_cg_idle_seconds = None
+if _core_graphics is not None:
+    try:
+        _cg_idle_seconds = _core_graphics.CGEventSourceSecondsSinceLastEventType
+        _cg_idle_seconds.argtypes = [ctypes.c_uint32, ctypes.c_uint32]
+        _cg_idle_seconds.restype = ctypes.c_double
+    except AttributeError:
+        _cg_idle_seconds = None
 
 
 def _current_background(state):
@@ -115,10 +133,26 @@ def _current_background(state):
 
 
 def _human_idle_sec():
-    """Real HID idle time (mouse/keyboard), same signal macOS's own
-    screensaver/display-sleep uses — independent of any tool's session state."""
+    """Real HID idle time (mouse/keyboard), independent of tool session state.
+
+    Prefer CoreGraphics: ``ioreg`` can stall or fail while we are suspending
+    the USB panel, and a failed read used to look like a wake.
+    """
+    if _cg_idle_seconds is not None:
+        try:
+            seconds = float(
+                _cg_idle_seconds(
+                    _CG_EVENT_SOURCE_STATE_HID_SYSTEM, _CG_ANY_INPUT_EVENT_TYPE
+                )
+            )
+            if seconds >= 0.0:
+                return seconds
+        except (OSError, ValueError, OverflowError):
+            pass
     try:
-        out = subprocess.run(["ioreg", "-c", "IOHIDSystem"], capture_output=True, timeout=5).stdout
+        out = subprocess.run(
+            ["ioreg", "-c", "IOHIDSystem"], capture_output=True, timeout=5
+        ).stdout
         m = HID_IDLE_RE.search(out)
         return int(m.group(1)) / 1e9 if m else None
     except (subprocess.SubprocessError, OSError):
@@ -135,13 +169,27 @@ def _display_is_asleep():
         return False
 
 
-def _screen_sleep_reason():
-    if _display_is_asleep():
+def _sleep_reason_from_state(display_asleep, idle_sec):
+    if display_asleep:
         return "main display asleep"
-    idle_sec = _human_idle_sec()
-    if idle_sec is not None and idle_sec > SCREEN_OFF_IDLE_SEC:
+    if idle_sec is not None and idle_sec >= SCREEN_OFF_IDLE_SEC:
         return f"{idle_sec:.0f}s with no HID input"
     return None
+
+
+def _should_stay_suspended(display_asleep, idle_sec):
+    """Fail closed: missing idle data is not a wake."""
+    if display_asleep:
+        return True
+    if idle_sec is None:
+        return True
+    return idle_sec >= SCREEN_OFF_IDLE_SEC
+
+
+def _screen_sleep_reason():
+    display_asleep = _display_is_asleep()
+    idle_sec = None if display_asleep else _human_idle_sec()
+    return _sleep_reason_from_state(display_asleep, idle_sec)
 
 
 def _env():
@@ -291,20 +339,27 @@ def _trcc_daemons():
     return daemons
 
 
-def _kill_trcc_daemon():
-    """Stop every exact TRCC daemon and clear a stale IPC socket."""
+def _kill_trcc_daemon(force=False):
+    """Stop every exact TRCC daemon and clear a stale IPC socket.
+
+    ``force=True`` skips ``trcc kill`` / App.close. That graceful path
+    disconnects the LY panel and can sit past the firmware's 2-3s
+    keepalive window, which is when the boot logo appears.
+    """
     _daemon_ready_event.clear()
     with _trcc_lock:
-        try:
-            _run_trcc("kill", timeout=DAEMON_KILL_GRACE_SEC)
-        except (OSError, subprocess.SubprocessError):
-            pass
-
-        deadline = time.monotonic() + DAEMON_KILL_GRACE_SEC
         survivors = _trcc_daemons()
-        while survivors and time.monotonic() < deadline:
-            time.sleep(0.2)
+        if not force:
+            try:
+                _run_trcc("kill", timeout=DAEMON_KILL_GRACE_SEC)
+            except (OSError, subprocess.SubprocessError):
+                pass
+
+            deadline = time.monotonic() + DAEMON_KILL_GRACE_SEC
             survivors = _trcc_daemons()
+            while survivors and time.monotonic() < deadline:
+                time.sleep(0.2)
+                survivors = _trcc_daemons()
 
         for pid, _rss_kib in survivors:
             try:
@@ -368,6 +423,10 @@ def _run_power_helper(action):
         )
 
 
+def _usb_helper_available():
+    return os.access(USB_POWER_HELPER, os.X_OK)
+
+
 def _panel_status_suspended():
     result = _run_power_helper("status")
     if result is None or result.returncode != 0:
@@ -379,32 +438,63 @@ def _panel_status_suspended():
     return None
 
 
+def _suspend_succeeded(result):
+    return bool(
+        result is not None
+        and result.returncode == 0
+        and "suspended=true" in (result.stdout or "")
+    )
+
+
 def _suspend_panel(reason):
-    """Blank once, release TRCC, then suspend only the target USB port."""
-    global _panel_power_checked, _screen_blanked
-    if _screen_blanked:
-        return
+    """Release TRCC, then suspend only the target USB port.
 
-    print(f"[push_loop] {reason} — suspending panel", file=sys.stderr)
-    _screen_blanked = True
-    _panel_power_checked = False
-    _screen_sleep_event.set()
-    _daemon_ready_event.clear()
+    LY firmware reverts to its boot logo ~2-3s after the last frame. The
+    previous path sent ``display sleep`` (a black frame), waited on a
+    graceful daemon shutdown, then USB-suspended — often after that
+    window. If USB suspend later dropped, the logo stayed because a
+    blanked panel was never re-suspended.
+    """
+    global _last_usb_suspend_at, _panel_power_checked, _screen_blanked
+    first = not _screen_blanked
+    if first:
+        print(f"[push_loop] {reason} — suspending panel", file=sys.stderr)
+        _screen_blanked = True
+        _panel_power_checked = False
+        _screen_sleep_event.set()
+        _daemon_ready_event.clear()
+    else:
+        if time.monotonic() - _last_usb_suspend_at < USB_SUSPEND_REASSERT_SEC:
+            return
+        if _panel_status_suspended() is True:
+            _last_usb_suspend_at = time.monotonic()
+            return
+        print(
+            f"[push_loop] USB suspend did not stick — reapplying ({reason})",
+            file=sys.stderr,
+        )
 
+    helper = _usb_helper_available()
+    result = None
     with _trcc_lock:
-        try:
-            result = _run_trcc("display", "sleep", DEVICE_KEY)
-            if result.returncode != 0:
+        if first and not helper:
+            try:
+                result = _run_trcc("display", "sleep", DEVICE_KEY)
+                if result.returncode != 0:
+                    print(
+                        f"[push_loop] black-frame fallback failed: "
+                        f"{result.stderr.strip()[-300:]}",
+                        file=sys.stderr,
+                    )
+            except (OSError, subprocess.SubprocessError) as exc:
                 print(
-                    f"[push_loop] black-frame fallback failed: "
-                    f"{result.stderr.strip()[-300:]}",
+                    f"[push_loop] black-frame fallback failed: {exc}",
                     file=sys.stderr,
                 )
-        except (OSError, subprocess.SubprocessError) as exc:
-            print(f"[push_loop] black-frame fallback failed: {exc}", file=sys.stderr)
-
-        _kill_trcc_daemon()
+        if first or _trcc_daemons():
+            _kill_trcc_daemon(force=True)
         result = _run_power_helper("suspend")
+        _last_usb_suspend_at = time.monotonic()
 
     if result is None:
         print(
@@ -412,16 +502,16 @@ def _suspend_panel(reason):
             "cannot be suspended",
             file=sys.stderr,
         )
-    elif result.returncode != 0:
-        print(
-            f"[push_loop] USB suspend failed: {result.stderr.strip()[-300:]}",
-            file=sys.stderr,
-        )
+    elif not _suspend_succeeded(result):
+        detail = (result.stderr or result.stdout or "").strip()[-300:]
+        print(f"[push_loop] USB suspend failed: {detail}", file=sys.stderr)
+    elif first:
+        print(f"[push_loop] USB suspend: {result.stdout.strip()}", file=sys.stderr)
 
 
 def _resume_panel_if_needed(force=False):
     """Resume a panel left suspended by this or an earlier service process."""
-    global _panel_power_checked, _screen_blanked
+    global _last_usb_suspend_at, _panel_power_checked, _screen_blanked
     suspended = True if force else _panel_status_suspended()
     if suspended:
         result = _run_power_helper("resume")
@@ -434,6 +524,7 @@ def _resume_panel_if_needed(force=False):
     _screen_sleep_event.clear()
     _screen_blanked = False
     _panel_power_checked = True
+    _last_usb_suspend_at = 0.0
     return True
 
 
@@ -454,17 +545,25 @@ def _send_image(retries=0, retry_delay=WAKE_SEND_IMAGE_RETRY_DELAY_SEC):
 def tick(state):
     global _panel_power_checked, _screen_blanked, _send_fail_streak
 
-    sleep_reason = _screen_sleep_reason()
-    if sleep_reason is not None:
-        _suspend_panel(sleep_reason)
-        return
-
-    just_woke = _screen_blanked
-    if just_woke:
-        print("[push_loop] display/input wake — resuming panel", file=sys.stderr)
-    if just_woke or not _panel_power_checked:
-        if not _resume_panel_if_needed(force=just_woke):
+    display_asleep = _display_is_asleep()
+    idle_sec = None if display_asleep else _human_idle_sec()
+    sleep_reason = _sleep_reason_from_state(display_asleep, idle_sec)
+    just_woke = False
+    if _screen_blanked:
+        if _should_stay_suspended(display_asleep, idle_sec):
+            _suspend_panel(sleep_reason or "idle query inconclusive")
             return
+        print("[push_loop] display/input wake — resuming panel", file=sys.stderr)
+        just_woke = True
+        if not _resume_panel_if_needed(force=True):
+            return
+    else:
+        if sleep_reason is not None:
+            _suspend_panel(sleep_reason)
+            return
+        if not _panel_power_checked:
+            if not _resume_panel_if_needed(force=False):
+                return
 
     # Provider/session scans and sensor subprocesses are deliberately off the
     # frame hot path.  A 30s endpoint timeout may delay a refresh, but cannot
@@ -532,7 +631,8 @@ def main():
         except Exception as exc:
             print(f"[push_loop] tick failed: {exc}", file=sys.stderr)
         elapsed = time.monotonic() - start
-        time.sleep(max(0.0, INTERVAL_SEC - elapsed))
+        interval = SLEEP_POLL_SEC if _screen_blanked else INTERVAL_SEC
+        time.sleep(max(0.0, interval - elapsed))
 
 
 if __name__ == "__main__":

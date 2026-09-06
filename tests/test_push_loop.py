@@ -25,6 +25,7 @@ class PushLoopTests(unittest.TestCase):
         push_loop._screen_blanked = False
         push_loop._send_fail_streak = 0
         push_loop._last_daemon_health_check_at = time.monotonic()
+        push_loop._last_usb_suspend_at = 0.0
 
     def tearDown(self):
         push_loop._screen_sleep_event.clear()
@@ -286,9 +287,12 @@ class PushLoopTests(unittest.TestCase):
                 self.assertEqual(push_loop._screen_sleep_reason(), "main display asleep")
         idle_mock.assert_not_called()
 
-    def test_suspend_panel_blanks_kills_and_suspends_only_once(self):
+    def test_suspend_panel_kills_and_suspends_without_display_sleep(self):
         completed = subprocess.CompletedProcess([], 0, "suspended=true", "")
         with ExitStack() as stack:
+            stack.enter_context(
+                mock.patch.object(push_loop, "_usb_helper_available", return_value=True)
+            )
             run_trcc = stack.enter_context(
                 mock.patch.object(push_loop, "_run_trcc", return_value=completed)
             )
@@ -303,11 +307,109 @@ class PushLoopTests(unittest.TestCase):
             push_loop._suspend_panel("main display asleep")
             push_loop._suspend_panel("main display asleep")
 
-        run_trcc.assert_called_once_with("display", "sleep", push_loop.DEVICE_KEY)
-        kill_daemon.assert_called_once_with()
+        run_trcc.assert_not_called()
+        kill_daemon.assert_called_once_with(force=True)
         power.assert_called_once_with("suspend")
         self.assertTrue(push_loop._screen_blanked)
         self.assertTrue(push_loop._screen_sleep_event.is_set())
+
+    def test_failed_idle_query_does_not_resume_blanked_panel(self):
+        push_loop._screen_blanked = True
+        push_loop._screen_sleep_event.set()
+        push_loop._last_usb_suspend_at = time.monotonic()
+        with ExitStack() as stack:
+            stack.enter_context(
+                mock.patch.object(push_loop, "_human_idle_sec", return_value=None)
+            )
+            resume = stack.enter_context(
+                mock.patch.object(push_loop, "_resume_panel_if_needed")
+            )
+            suspend = stack.enter_context(
+                mock.patch.object(push_loop, "_suspend_panel")
+            )
+            send = stack.enter_context(mock.patch.object(push_loop, "_send_image"))
+            push_loop.tick({})
+
+        resume.assert_not_called()
+        send.assert_not_called()
+        suspend.assert_called_once_with("idle query inconclusive")
+        self.assertTrue(push_loop._screen_blanked)
+
+    def test_recent_input_resumes_blanked_panel(self):
+        push_loop._screen_blanked = True
+        push_loop._screen_sleep_event.set()
+        with ExitStack() as stack:
+            stack.enter_context(
+                mock.patch.object(
+                    push_loop,
+                    "READERS",
+                    (lambda: {"tool": "Test", "state": "idle"},),
+                )
+            )
+            stack.enter_context(
+                mock.patch.object(
+                    push_loop.hardware,
+                    "read_status",
+                    return_value={"tool": "Hardware"},
+                )
+            )
+            stack.enter_context(
+                mock.patch.object(push_loop, "_human_idle_sec", return_value=0.2)
+            )
+            stack.enter_context(
+                mock.patch.object(push_loop, "_current_background", return_value=None)
+            )
+            stack.enter_context(
+                mock.patch.object(push_loop, "render", return_value=_FakeImage())
+            )
+            stack.enter_context(
+                mock.patch.object(
+                    push_loop.subprocess,
+                    "run",
+                    return_value=subprocess.CompletedProcess([], 0, "", ""),
+                )
+            )
+            resume = stack.enter_context(
+                mock.patch.object(
+                    push_loop, "_resume_panel_if_needed", return_value=True
+                )
+            )
+            for cache_patch in self._cache_state_patches():
+                stack.enter_context(cache_patch)
+            push_loop.tick({})
+
+        resume.assert_called_once_with(force=True)
+
+    def test_suspend_reasserts_when_usb_not_suspended(self):
+        completed = subprocess.CompletedProcess([], 0, "suspended=true", "")
+        push_loop._screen_blanked = True
+        push_loop._screen_sleep_event.set()
+        push_loop._last_usb_suspend_at = 0.0
+        with ExitStack() as stack:
+            stack.enter_context(
+                mock.patch.object(push_loop, "_usb_helper_available", return_value=True)
+            )
+            stack.enter_context(
+                mock.patch.object(
+                    push_loop, "_panel_status_suspended", return_value=False
+                )
+            )
+            stack.enter_context(
+                mock.patch.object(push_loop, "_trcc_daemons", return_value=[])
+            )
+            kill_daemon = stack.enter_context(
+                mock.patch.object(push_loop, "_kill_trcc_daemon")
+            )
+            power = stack.enter_context(
+                mock.patch.object(
+                    push_loop, "_run_power_helper", return_value=completed
+                )
+            )
+            push_loop._suspend_panel("901s with no HID input")
+
+        kill_daemon.assert_not_called()
+        power.assert_called_once_with("suspend")
+        self.assertTrue(push_loop._screen_blanked)
 
     def test_resume_panel_recovers_state_left_by_previous_process(self):
         completed = subprocess.CompletedProcess([], 0, "suspended=false", "")
