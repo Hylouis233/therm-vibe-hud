@@ -87,9 +87,18 @@ static IOReturn print_status(IOUSBDeviceInterface **device) {
 }
 
 static int set_suspended(IOUSBDeviceInterface **device, bool suspend) {
-    IOReturn kr = (*device)->USBDeviceOpen(device);
-    if (kr == kIOReturnExclusiveAccess) {
-        kr = (*device)->USBDeviceOpenSeize(device);
+    IOReturn kr = kIOReturnSuccess;
+    for (int attempt = 0; attempt < 5; attempt++) {
+        kr = (*device)->USBDeviceOpen(device);
+        if (kr == kIOReturnExclusiveAccess) {
+            kr = (*device)->USBDeviceOpenSeize(device);
+        }
+        if (kr == kIOReturnSuccess) {
+            break;
+        }
+        if (attempt < 4) {
+            usleep(200000);  /* 200ms retry to let prior owner release */
+        }
     }
     if (kr != kIOReturnSuccess) {
         fprintf(stderr, "USBDeviceOpen failed: 0x%08x\n", (unsigned int)kr);
