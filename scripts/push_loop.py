@@ -46,6 +46,11 @@ DAEMON_HEALTH_CHECK_INTERVAL_SEC = 60
 # failures, so transient single-tick hiccups never trigger a restart.
 DAEMON_RESTART_FAIL_THRESHOLD = 5
 DAEMON_RESTART_COOLDOWN_SEC = 30
+# Consecutive access-denied send failures before assuming a stale daemon holds
+# the USB claim (resume alone cannot clear that) and force-killing every
+# daemon. Cooldown keeps a genuinely-absent device from force-clearing forever.
+USB_CLAIM_RECOVERY_THRESHOLD = 3
+USB_CLAIM_RECOVERY_COOLDOWN_SEC = 15
 DAEMON_KILL_GRACE_SEC = 5
 PROVIDER_POLL_INTERVAL_SEC = 3
 HARDWARE_POLL_INTERVAL_SEC = 2
@@ -93,10 +98,13 @@ _trcc_lock = threading.RLock()
 _screen_sleep_event = threading.Event()
 _daemon_ready_event = threading.Event()
 _send_fail_streak = 0
+_usb_claim_fail_streak = 0
+_usb_claim_recovery_at = 0.0
 _last_daemon_restart_at = 0.0
 _last_daemon_health_check_at = 0.0
 _panel_power_checked = False
 _last_usb_suspend_at = 0.0
+_last_wake_log = 0.0
 
 try:
     _core_graphics = ctypes.CDLL(
@@ -135,28 +143,34 @@ def _current_background(state):
 def _human_idle_sec():
     """Real HID idle time (mouse/keyboard), independent of tool session state.
 
-    Prefer CoreGraphics: ``ioreg`` can stall or fail while we are suspending
-    the USB panel, and a failed read used to look like a wake.
+    Use the maximum of CG and ioreg when both available. This avoids false
+    "recent input" from CG (which can be polluted or inaccurate) when ioreg
+    clearly shows long idle. Prevents spurious wake loops while blanked.
     """
+    cg = None
     if _cg_idle_seconds is not None:
         try:
-            seconds = float(
+            s = float(
                 _cg_idle_seconds(
                     _CG_EVENT_SOURCE_STATE_HID_SYSTEM, _CG_ANY_INPUT_EVENT_TYPE
                 )
             )
-            if seconds >= 0.0:
-                return seconds
+            if s >= 0.0:
+                cg = s
         except (OSError, ValueError, OverflowError):
             pass
+    ioreg = None
     try:
         out = subprocess.run(
             ["ioreg", "-c", "IOHIDSystem"], capture_output=True, timeout=5
         ).stdout
         m = HID_IDLE_RE.search(out)
-        return int(m.group(1)) / 1e9 if m else None
+        if m:
+            ioreg = int(m.group(1)) / 1e9
     except (subprocess.SubprocessError, OSError):
-        return None
+        pass
+    vals = [v for v in (cg, ioreg) if v is not None]
+    return max(vals) if vals else None
 
 
 def _display_is_asleep():
@@ -330,7 +344,14 @@ def _trcc_daemons():
             and script_python_path.parent == trcc_bin.parent
             and script_python_path.name.startswith("python")
         )
-        if command != direct_command and not module_command and not script_command:
+        # The vendor client spawns the daemon with a lowercase copy of the
+        # bundle path as argv0 (APFS is case-insensitive), so the direct-form
+        # match must compare case-insensitively — an exact-case-only match
+        # made every kill path a silent no-op while real daemons kept
+        # holding the USB claim, and the follow-up socket unlink then cut
+        # the client off from the live daemon entirely.
+        if (command.lower() != direct_command.lower()
+                and not module_command and not script_command):
             continue
         try:
             daemons.append((int(fields[0]), int(fields[1])))
@@ -367,6 +388,18 @@ def _kill_trcc_daemon(force=False):
             except (OSError, ProcessLookupError):
                 pass
 
+        # Wait for processes to actually exit (even in force path) so USB
+        # claim is released. This helps the power helper succeed with
+        # Open/Seize instead of repeated 0xe00002c5 exclusive errors.
+        deadline = time.monotonic() + 2.0
+        survivors = _trcc_daemons()
+        while survivors and time.monotonic() < deadline:
+            time.sleep(0.2)
+            survivors = _trcc_daemons()
+
+        # Extra sleep for USB stack to release claim.
+        time.sleep(0.3)
+
         try:
             Path("/tmp/trcc.sock").unlink(missing_ok=True)
         except OSError:
@@ -376,12 +409,18 @@ def _kill_trcc_daemon(force=False):
 def _maybe_restart_daemon(reason):
     global _last_daemon_restart_at
     now = time.monotonic()
-    if now - _last_daemon_restart_at < DAEMON_RESTART_COOLDOWN_SEC:
+    cooldown = 5 if "failure" in reason.lower() else DAEMON_RESTART_COOLDOWN_SEC
+    if now - _last_daemon_restart_at < cooldown:
         print("[push_loop] daemon restart on cool-down, skipping", file=sys.stderr)
         return False
     _last_daemon_restart_at = now
     print(f"[push_loop] recycling TRCC daemon: {reason}", file=sys.stderr)
     _kill_trcc_daemon()
+    # After killing the daemon (which holds exclusive USB access), explicitly
+    # resume/power the port. This ensures the device is ready for the next
+    # send-image (which will respawn the daemon). Prevents access-denied
+    # loops after recovery kills. Best-effort; ignore failures here.
+    _run_power_helper("resume")
     return True
 
 
@@ -477,23 +516,33 @@ def _suspend_panel(reason):
     helper = _usb_helper_available()
     result = None
     with _trcc_lock:
-        if first and not helper:
+        if first:
+            # Always push a black frame on initial suspend so the panel is
+            # at least blanked during the transition, even if the later USB
+            # suspend cannot be obtained. This prevents bright content/logo
+            # when the helper cannot seize the device.
             try:
                 result = _run_trcc("display", "sleep", DEVICE_KEY)
                 if result.returncode != 0:
                     print(
-                        f"[push_loop] black-frame fallback failed: "
+                        f"[push_loop] black-frame failed: "
                         f"{result.stderr.strip()[-300:]}",
                         file=sys.stderr,
                     )
             except (OSError, subprocess.SubprocessError) as exc:
                 print(
-                    f"[push_loop] black-frame fallback failed: {exc}",
+                    f"[push_loop] black-frame failed: {exc}",
                     file=sys.stderr,
                 )
         if first or _trcc_daemons():
             _kill_trcc_daemon(force=True)
-        result = _run_power_helper("suspend")
+        result = None
+        for attempt in range(5):
+            result = _run_power_helper("suspend")
+            if _suspend_succeeded(result):
+                break
+            if attempt < 4:
+                time.sleep(0.4)
         _last_usb_suspend_at = time.monotonic()
 
     if result is None:
@@ -511,15 +560,29 @@ def _suspend_panel(reason):
 
 def _resume_panel_if_needed(force=False):
     """Resume a panel left suspended by this or an earlier service process."""
-    global _last_usb_suspend_at, _panel_power_checked, _screen_blanked
+    global _last_usb_suspend_at, _panel_power_checked, _screen_blanked, _last_wake_log
     suspended = True if force else _panel_status_suspended()
-    if suspended:
-        result = _run_power_helper("resume")
+    if suspended or force:
+        # On resume (especially forced on wake), ensure no daemon holds the
+        # device so the USB resume helper can seize and power the port back.
+        # The subsequent send-image will respawn the daemon.
+        if _trcc_daemons():
+            _kill_trcc_daemon(force=True)
+        result = None
+        for attempt in range(5):
+            result = _run_power_helper("resume")
+            if result is not None and result.returncode == 0:
+                break
+            if attempt < 4:
+                time.sleep(0.4)
         if result is not None and result.returncode != 0:
-            print(
-                f"[push_loop] USB resume failed: {result.stderr.strip()[-300:]}",
-                file=sys.stderr,
-            )
+            now = time.monotonic()
+            if now - _last_wake_log > 5:
+                print(
+                    f"[push_loop] USB resume failed: {result.stderr.strip()[-300:]}",
+                    file=sys.stderr,
+                )
+                _last_wake_log = now
             return False
     _screen_sleep_event.clear()
     _screen_blanked = False
@@ -543,7 +606,7 @@ def _send_image(retries=0, retry_delay=WAKE_SEND_IMAGE_RETRY_DELAY_SEC):
 
 
 def tick(state):
-    global _panel_power_checked, _screen_blanked, _send_fail_streak
+    global _panel_power_checked, _screen_blanked, _send_fail_streak, _last_wake_log, _usb_claim_fail_streak, _usb_claim_recovery_at
 
     display_asleep = _display_is_asleep()
     idle_sec = None if display_asleep else _human_idle_sec()
@@ -553,10 +616,19 @@ def tick(state):
         if _should_stay_suspended(display_asleep, idle_sec):
             _suspend_panel(sleep_reason or "idle query inconclusive")
             return
-        print("[push_loop] display/input wake — resuming panel", file=sys.stderr)
+        now = time.monotonic()
+        if now - _last_wake_log > 5:
+            print("[push_loop] display/input wake — resuming panel", file=sys.stderr)
+            _last_wake_log = now
         just_woke = True
-        if not _resume_panel_if_needed(force=True):
-            return
+        _resume_panel_if_needed(force=True)  # best effort; ignore failure
+        # Always clear blanked and proceed to send a frame. This unstucks
+        # black screen if USB resume had transient claim issues (daemon
+        # holding device). The send will re-establish display content.
+        _screen_sleep_event.clear()
+        _screen_blanked = False
+        _panel_power_checked = True
+        _last_usb_suspend_at = 0.0
     else:
         if sleep_reason is not None:
             _suspend_panel(sleep_reason)
@@ -579,20 +651,47 @@ def tick(state):
     img = render(statuses, hw, background=_current_background(state))
     img.save(FRAME_PATH)
 
-    result = _send_image(retries=WAKE_SEND_IMAGE_RETRIES if just_woke else 0)
+    result = _send_image(retries=WAKE_SEND_IMAGE_RETRIES if just_woke else 2)
     if result.returncode == 0:
         _send_fail_streak = 0
+        _usb_claim_fail_streak = 0
         _maybe_recycle_daemon()
     else:
+        err = (result.stderr or result.stdout or "").strip()[-300:]
         _send_fail_streak += 1
         print(
-            f"[push_loop] send-image failed (streak={_send_fail_streak}): "
-            f"{result.stderr.strip()[-300:]}",
+            f"[push_loop] send-image failed (streak={_send_fail_streak}): {err}",
             file=sys.stderr,
         )
-        if _send_fail_streak >= DAEMON_RESTART_FAIL_THRESHOLD:
+        if "access denied" in err.lower() or "usb" in err.lower():
+            # Power/claim issue, not daemon wedged. Resume to fix port, do not
+            # count toward restart to avoid kill cycles that make it worse.
+            _usb_claim_fail_streak += 1
+            if (_usb_claim_fail_streak >= USB_CLAIM_RECOVERY_THRESHOLD
+                    and time.monotonic() >= _usb_claim_recovery_at):
+                # A stale daemon orphaned by an earlier crashed service can
+                # hold the USB claim indefinitely — resume alone never clears
+                # that (observed as an endless streak=1 access-denied loop).
+                # Kill every daemon to release the claim, power the port back,
+                # and let the next send-image respawn a fresh daemon.
+                print(
+                    f"[push_loop] USB claim denied {_usb_claim_fail_streak}x — "
+                    "force-clearing daemons and resuming port",
+                    file=sys.stderr,
+                )
+                _kill_trcc_daemon(force=True)
+                _run_power_helper("resume")
+                _usb_claim_fail_streak = 0
+                _usb_claim_recovery_at = (
+                    time.monotonic() + USB_CLAIM_RECOVERY_COOLDOWN_SEC
+                )
+            else:
+                _run_power_helper("resume")
+            _send_fail_streak = max(0, _send_fail_streak - 2)
+        elif _send_fail_streak >= DAEMON_RESTART_FAIL_THRESHOLD:
             _maybe_restart_daemon("sustained frame failures")
             _send_fail_streak = 0
+            _run_power_helper("resume")
 
 
 def _run_official_theme(theme_id):

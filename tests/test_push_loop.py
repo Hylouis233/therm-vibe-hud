@@ -194,7 +194,7 @@ class PushLoopTests(unittest.TestCase):
         self.assertEqual(len(send_calls), 3)
         self.assertFalse(push_loop._screen_blanked)
 
-    def test_steady_state_tick_does_not_retry_send_image(self):
+    def test_steady_state_tick_retries_send_image_up_to_twice(self):
         calls = []
 
         def fake_run(args, **kwargs):
@@ -237,7 +237,72 @@ class PushLoopTests(unittest.TestCase):
             push_loop.tick({})
 
         send_calls = [c for c in calls if "send-image" in c]
-        self.assertEqual(len(send_calls), 1)
+        self.assertEqual(len(send_calls), 3)
+
+    def test_sustained_usb_claim_denial_force_clears_daemons(self):
+        push_loop._usb_claim_fail_streak = 0
+        push_loop._usb_claim_recovery_at = 0.0
+
+        def fake_run(args, **kwargs):
+            return subprocess.CompletedProcess(
+                args, 1, "", "USBError: [Errno 13] Access denied"
+            )
+
+        with ExitStack() as stack:
+            stack.enter_context(
+                mock.patch.object(
+                    push_loop,
+                    "READERS",
+                    (lambda: {"tool": "Test", "state": "idle"},),
+                )
+            )
+            stack.enter_context(
+                mock.patch.object(
+                    push_loop.hardware,
+                    "read_status",
+                    return_value={"tool": "Hardware"},
+                )
+            )
+            stack.enter_context(
+                mock.patch.object(push_loop, "_human_idle_sec", return_value=0)
+            )
+            stack.enter_context(
+                mock.patch.object(push_loop, "_current_background", return_value=None)
+            )
+            stack.enter_context(
+                mock.patch.object(push_loop, "render", return_value=_FakeImage())
+            )
+            stack.enter_context(
+                mock.patch.object(push_loop.subprocess, "run", side_effect=fake_run)
+            )
+            stack.enter_context(mock.patch.object(push_loop.time, "sleep"))
+            stack.enter_context(
+                mock.patch.object(push_loop, "_screen_blanked", False, create=True)
+            )
+            kill_daemon = stack.enter_context(
+                mock.patch.object(push_loop, "_kill_trcc_daemon")
+            )
+            stack.enter_context(
+                mock.patch.object(
+                    push_loop,
+                    "_run_power_helper",
+                    return_value=subprocess.CompletedProcess([], 0, "", ""),
+                )
+            )
+            for _ in range(3):
+                push_loop.tick({})
+
+            kill_daemon.assert_called_once_with(force=True)
+
+            # Cooldown window: another denial streak must not force-clear
+            # again until USB_CLAIM_RECOVERY_COOLDOWN_SEC has elapsed.
+            for _ in range(3):
+                push_loop.tick({})
+            kill_daemon.assert_called_once_with(force=True)
+
+        # Streak kept counting through the cooldown so the first failure
+        # after it expires triggers recovery immediately.
+        self.assertEqual(push_loop._usb_claim_fail_streak, 3)
 
     def test_trcc_commands_use_daemon_and_widened_timeout(self):
         calls = []
@@ -307,7 +372,9 @@ class PushLoopTests(unittest.TestCase):
             push_loop._suspend_panel("main display asleep")
             push_loop._suspend_panel("main display asleep")
 
-        run_trcc.assert_not_called()
+        # Initial suspend deliberately pushes a black frame before killing
+        # the daemon, so a failed helper seizure can't leave bright content.
+        run_trcc.assert_called_once_with("display", "sleep", "0416:5408")
         kill_daemon.assert_called_once_with(force=True)
         power.assert_called_once_with("suspend")
         self.assertTrue(push_loop._screen_blanked)
@@ -432,13 +499,18 @@ class PushLoopTests(unittest.TestCase):
         listing = "\n".join(
             [
                 " 123 400000 /Applications/TRCC.app/Contents/MacOS/TRCC daemon",
+                # The vendor client spawns daemons with a lowercase argv0
+                # copy of the bundle path (APFS is case-insensitive).
+                " 999 50000 /Applications/TRCC.app/Contents/MacOS/trcc daemon",
                 " 456 1000 /bin/zsh -c pgrep -f 'TRCC daemon'",
                 " 789 2000 /Applications/TRCC.app/Contents/MacOS/TRCC status",
             ]
         )
         result = subprocess.CompletedProcess([], 0, listing, "")
         with mock.patch.object(push_loop.subprocess, "run", return_value=result):
-            self.assertEqual(push_loop._trcc_daemons(), [(123, 400000)])
+            self.assertEqual(
+                push_loop._trcc_daemons(), [(123, 400000), (999, 50000)]
+            )
 
     def test_daemon_scan_accepts_configured_python_module_runtime(self):
         trcc_bin = "/opt/Therm Vibe/trcc-venv/bin/trcc"
