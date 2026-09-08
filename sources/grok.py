@@ -25,14 +25,15 @@ GROK_BOT_API_BASE = os.environ.get(
     "THERM_VIBE_GROK_BOT_API_BASE", "https://api2.cursor.sh"
 ).rstrip("/")
 DASHBOARD_SERVICE = "aiserver.v1.DashboardService"
-BOT_USAGE_CACHE_SEC = 60
-CLI_USAGE_CACHE_SEC = 60
+BOT_USAGE_CACHE_SEC = 5
+CLI_USAGE_CACHE_SEC = 5
 REQUEST_TIMEOUT_SEC = 30
 MAX_SESSIONS = 6
 
 _cache_lock = threading.Lock()
 _cli_cache = None
 _cli_cache_at = 0.0
+_cli_log_mtime = 0.0
 _bot_cache = None
 _bot_cache_at = 0.0
 _usage_cache = {}
@@ -218,10 +219,19 @@ def _latest_cli_billing():
 
 
 def _cli_usage(now=None):
-    global _cli_cache, _cli_cache_at
+    global _cli_cache, _cli_cache_at, _cli_log_mtime
     now = time.time() if now is None else now
+    log_mtime = 0.0
+    try:
+        log_mtime = UNIFIED_LOG_PATH.stat().st_mtime
+    except OSError:
+        pass
     with _cache_lock:
-        if _cli_cache is not None and now - _cli_cache_at < CLI_USAGE_CACHE_SEC:
+        if (
+            _cli_cache is not None
+            and now - _cli_cache_at < CLI_USAGE_CACHE_SEC
+            and log_mtime <= _cli_log_mtime
+        ):
             return _cli_cache
 
     active = _active_sessions(now=now)
@@ -278,6 +288,7 @@ def _cli_usage(now=None):
     with _cache_lock:
         _cli_cache = result
         _cli_cache_at = now
+        _cli_log_mtime = log_mtime
     return result
 
 
@@ -413,7 +424,7 @@ def _bot_usage(now=None):
             return _bot_cache
 
     result = {
-        "running": _bot_process_running(),
+        "running": False,
         "percent": None,
         "resets_at": None,
         "period_percent": None,
@@ -421,6 +432,12 @@ def _bot_usage(now=None):
         "plan": None,
         "available": None,
     }
+    if not GROK_BOT_SECRETS_PATH.exists():
+        with _cache_lock:
+            _bot_cache = result
+            _bot_cache_at = now
+        return result
+    result["running"] = _bot_process_running()
     credentials = _bot_credentials()
     if credentials is not None:
         try:
@@ -473,7 +490,7 @@ def read_status():
         "display_name": "Grok",
         "state": "running" if active_count else "no session",
         "identity": cli.get("model"),
-        "plan_type": billing.get("plan") or bot.get("plan"),
+        "plan_type": billing.get("plan"),
         "active_count": active_count,
         "sessions": sessions,
         "context_percent": cli.get("context_percent"),
