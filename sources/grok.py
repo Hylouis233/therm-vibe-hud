@@ -31,6 +31,31 @@ REQUEST_TIMEOUT_SEC = 30
 MAX_SESSIONS = 6
 SESSION_IDLE_SEC = 45
 
+# Real-time CLI quota: the same endpoint the CLI's own billing module calls.
+# The log snapshot only refreshes while a CLI is actually running, so usage
+# that happened elsewhere (other machines, exhausted-then-reset windows) goes
+# stale the moment the local CLI exits. Read-only against the CLI's
+# credential store: tokens are kept in memory for this process only.
+GROK_AUTH_PATH = GROK_HOME / "auth.json"
+GROK_BILLING_URL = "https://cli-chat-proxy.grok.com/v1/billing?format=credits"
+GROK_TOKEN_URL = "https://auth.x.ai/oauth/token"
+# Set to an HTTP proxy URL when the endpoint is not reachable directly;
+# empty default connects via the standard opener.
+GROK_PROXY_URL = os.environ.get("THERM_VIBE_HUD_GROK_PROXY", "")
+_grok_opener = (
+    urllib.request.build_opener(
+        urllib.request.ProxyHandler(
+            {"http": GROK_PROXY_URL, "https": GROK_PROXY_URL}
+        )
+    )
+    if GROK_PROXY_URL
+    else urllib.request.build_opener()
+)
+LIVE_BILLING_CACHE_SEC = 60
+LIVE_BILLING_FETCH_TIMEOUT_SEC = 20
+LIVE_BILLING_BACKOFF_BASE_SEC = 60
+LIVE_BILLING_BACKOFF_MAX_SEC = 10 * 60
+
 _cache_lock = threading.Lock()
 _cli_cache = None
 _cli_cache_at = 0.0
@@ -38,6 +63,9 @@ _cli_log_mtime = 0.0
 _bot_cache = None
 _bot_cache_at = 0.0
 _usage_cache = {}
+_live_billing_cache = None  # (billing_dict, fetched_at)
+_live_billing_failure_count = 0
+_live_billing_backoff_until = 0.0
 
 _COMMON_CRYPTO = None
 if os.uname().sysname == "Darwin":
@@ -222,6 +250,136 @@ def _latest_cli_billing():
     return None
 
 
+def _grok_auth():
+    """First usable credential entry from the CLI's auth.json (read-only)."""
+    data = _read_json(GROK_AUTH_PATH)
+    if not isinstance(data, dict):
+        return None
+    for entry in data.values():
+        if isinstance(entry, dict) and entry.get("key"):
+            return (
+                entry["key"],
+                entry.get("refresh_token"),
+                entry.get("oidc_client_id"),
+            )
+    return None
+
+
+def _refresh_grok_token(refresh_token, client_id):
+    """Exchange the OIDC refresh token; the new key stays in memory only."""
+    if not (refresh_token and client_id):
+        return None
+    body = json.dumps(
+        {
+            "grant_type": "refresh_token",
+            "refresh_token": refresh_token,
+            "client_id": client_id,
+        }
+    ).encode()
+    req = urllib.request.Request(
+        GROK_TOKEN_URL,
+        data=body,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with _grok_opener.open(req, timeout=LIVE_BILLING_FETCH_TIMEOUT_SEC) as resp:
+        payload = json.loads(resp.read())
+    token = payload.get("access_token")
+    return token if isinstance(token, str) and token else None
+
+
+def _billing_from_payload(payload, now):
+    config = payload.get("config")
+    period = (config or {}).get("currentPeriod") or {}
+    return {
+        "percent": _number((config or {}).get("creditUsagePercent")),
+        "resets_at": _parse_time(period.get("end")),
+        "plan": payload.get("subscriptionTier"),
+        "on_demand_cap": _number(((config or {}).get("onDemandCap") or {}).get("val")),
+        "on_demand_used": _number(((config or {}).get("onDemandUsed") or {}).get("val")),
+        "prepaid_balance": _number(((config or {}).get("prepaidBalance") or {}).get("val")),
+        "updated_at": now,
+        "live": True,
+    }
+
+
+def _fetch_live_billing_once(key):
+    req = urllib.request.Request(
+        GROK_BILLING_URL,
+        headers={
+            "Authorization": f"Bearer {key}",
+            "Accept": "application/json",
+            "User-Agent": "therm-vibe-hud",
+        },
+    )
+    with _grok_opener.open(req, timeout=LIVE_BILLING_FETCH_TIMEOUT_SEC) as resp:
+        return json.loads(resp.read())
+
+
+def _fetch_live_billing(now=None):
+    """Account-wide credits config straight from the live endpoint.
+
+    Cached for LIVE_BILLING_CACHE_SEC; consecutive failures back off
+    exponentially so an unreachable endpoint doesn't hammer it forever.
+    Returns the last good value while it is still the best we have."""
+    global _live_billing_failure_count, _live_billing_backoff_until, _live_billing_cache
+    now = time.time() if now is None else now
+    if _live_billing_cache is not None and now - _live_billing_cache[1] < LIVE_BILLING_CACHE_SEC:
+        return _live_billing_cache[0]
+    if now < _live_billing_backoff_until:
+        return _live_billing_cache[0] if _live_billing_cache is not None else None
+    auth = _grok_auth()
+    if auth is None:
+        return _live_billing_cache[0] if _live_billing_cache is not None else None
+    key, refresh_token, client_id = auth
+    billing = None
+    for attempt in range(2):
+        try:
+            payload = _fetch_live_billing_once(key)
+            if not isinstance(payload.get("config"), dict):
+                raise ValueError("billing response missing config")
+            billing = _billing_from_payload(payload, now)
+            break
+        except urllib.error.HTTPError as exc:
+            if exc.code in (401, 403) and refresh_token and attempt == 0:
+                try:
+                    new_key = _refresh_grok_token(refresh_token, client_id)
+                except (urllib.error.URLError, OSError, ValueError):
+                    new_key = None
+                if new_key:
+                    key = new_key
+                    continue
+            break
+        except (urllib.error.URLError, OSError, ValueError):
+            break
+    if billing is None:
+        _live_billing_failure_count += 1
+        backoff = min(
+            LIVE_BILLING_BACKOFF_BASE_SEC * (2 ** (_live_billing_failure_count - 1)),
+            LIVE_BILLING_BACKOFF_MAX_SEC,
+        )
+        _live_billing_backoff_until = now + backoff
+        return _live_billing_cache[0] if _live_billing_cache is not None else None
+    _live_billing_failure_count = 0
+    _live_billing_backoff_until = 0.0
+    _live_billing_cache = (billing, now)
+    return billing
+
+
+def _merged_cli_billing(now=None):
+    """Live account-wide credits first; the log snapshot fills the plan
+    label (the live payload doesn't carry it) and acts as the fallback."""
+    snapshot = _latest_cli_billing() or {}
+    live = _fetch_live_billing(now=now)
+    if live is None:
+        return snapshot or None
+    merged = dict(snapshot)
+    merged.update(live)
+    if live.get("plan") is None:
+        merged["plan"] = snapshot.get("plan")
+    return merged
+
+
 def _cli_usage(now=None):
     global _cli_cache, _cli_cache_at, _cli_log_mtime
     now = time.time() if now is None else now
@@ -287,7 +445,7 @@ def _cli_usage(now=None):
         "cached_tokens_24h": totals["cachedReadTokens"],
         "model_calls_24h": totals["modelCalls"],
         "model": models[0] if models else None,
-        "billing": _latest_cli_billing(),
+        "billing": _merged_cli_billing(now),
     }
     with _cache_lock:
         _cli_cache = result

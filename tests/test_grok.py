@@ -3,6 +3,7 @@ import os
 import tempfile
 import time
 import unittest
+import urllib.error
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest import mock
@@ -17,6 +18,16 @@ class GrokStatusTests(unittest.TestCase):
         grok._cli_cache_at = 0.0
         grok._bot_cache = None
         grok._bot_cache_at = 0.0
+        grok._live_billing_cache = None
+        grok._live_billing_failure_count = 0
+        grok._live_billing_backoff_until = 0.0
+        # Keep tests hermetic: never read the developer's real credentials
+        # and never let read_status reach the live billing endpoint.
+        self._auth_patch = mock.patch.object(
+            grok, "GROK_AUTH_PATH", Path("/nonexistent-grok-auth.json")
+        )
+        self._auth_patch.start()
+        self.addCleanup(self._auth_patch.stop)
 
     def test_cli_and_bot_are_merged_without_private_paths(self):
         with tempfile.TemporaryDirectory() as raw_root:
@@ -138,6 +149,93 @@ class GrokStatusTests(unittest.TestCase):
 
         self.assertEqual(len(sessions), 1)
         self.assertEqual(sessions[0]["state"], "idle")
+
+    def test_live_billing_overrides_stale_snapshot(self):
+        payload = {
+            "config": {
+                "creditUsagePercent": 100.0,
+                "currentPeriod": {
+                    "type": "USAGE_PERIOD_TYPE_WEEKLY",
+                    "start": "2026-09-05T22:27:41Z",
+                    "end": "2026-09-12T22:27:41Z",
+                },
+                "onDemandCap": {"val": 0},
+                "onDemandUsed": {"val": 0},
+                "prepaidBalance": {"val": 0},
+            }
+        }
+        with mock.patch.object(
+            grok, "_grok_auth", return_value=("key", "refresh", "client")
+        ):
+            with mock.patch.object(
+                grok, "_fetch_live_billing_once", return_value=payload
+            ):
+                with mock.patch.object(
+                    grok,
+                    "_latest_cli_billing",
+                    return_value={
+                        "percent": 76.0,
+                        "resets_at": 1_789_252_061.0,
+                        "plan": "SuperGrok Heavy",
+                        "updated_at": 1_788_758_846.0,
+                    },
+                ):
+                    billing = grok._merged_cli_billing(now=1_788_850_000.0)
+
+        self.assertEqual(billing["percent"], 100.0)
+        self.assertEqual(billing["resets_at"], grok._parse_time("2026-09-12T22:27:41Z"))
+        self.assertEqual(billing["plan"], "SuperGrok Heavy")
+        self.assertEqual(billing["updated_at"], 1_788_850_000.0)
+        self.assertTrue(billing["live"])
+
+    def test_live_billing_refreshes_once_on_401_then_succeeds(self):
+        payload = {"config": {"creditUsagePercent": 40.0}}
+        calls = []
+
+        def flaky(key):
+            calls.append(key)
+            if len(calls) == 1:
+                raise urllib.error.HTTPError(
+                    grok.GROK_BILLING_URL, 401, "Unauthorized", None, None
+                )
+            return payload
+
+        with mock.patch.object(
+            grok, "_grok_auth", return_value=("stale-key", "refresh", "client")
+        ):
+            with mock.patch.object(grok, "_fetch_live_billing_once", side_effect=flaky):
+                with mock.patch.object(
+                    grok, "_refresh_grok_token", return_value="fresh-key"
+                ) as refresh_mock:
+                    billing = grok._fetch_live_billing(now=1_788_850_000.0)
+
+        self.assertEqual(billing["percent"], 40.0)
+        self.assertEqual(calls, ["stale-key", "fresh-key"])
+        refresh_mock.assert_called_once_with("refresh", "client")
+
+    def test_live_billing_failure_falls_back_to_log_snapshot(self):
+        with mock.patch.object(
+            grok, "_grok_auth", return_value=("key", None, None)
+        ):
+            with mock.patch.object(
+                grok,
+                "_fetch_live_billing_once",
+                side_effect=urllib.error.URLError("unreachable"),
+            ):
+                with mock.patch.object(
+                    grok,
+                    "_latest_cli_billing",
+                    return_value={"percent": 76.0, "plan": "SuperGrok Heavy"},
+                ):
+                    billing = grok._merged_cli_billing(now=1_788_850_000.0)
+
+        self.assertEqual(billing["percent"], 76.0)
+        self.assertNotIn("live", billing)
+        # The failure set a backoff window; a call inside it must not fetch.
+        self.assertGreater(grok._live_billing_backoff_until, 1_788_850_000.0)
+        with mock.patch.object(grok, "_fetch_live_billing_once") as once:
+            grok._fetch_live_billing(now=1_788_850_001.0)
+        once.assert_not_called()
 
     def test_bot_usage_parses_percent_plan_and_millisecond_reset(self):
         status_payload = {
