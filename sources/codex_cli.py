@@ -44,15 +44,22 @@ CHATGPT_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
 OAUTH_REFRESH_URL = "https://auth.openai.com/oauth/token"
 OAUTH_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
 LIVE_QUOTA_FETCH_TIMEOUT_SEC = 30
-# chatgpt.com is DNS-poisoned on this network (GFW injects unrelated IPs even
-# via public DNS) — urllib's automatic system-proxy detection (via macOS
-# _scproxy) is not reliably picked up from this daemon's LaunchAgent context,
-# so the mihomo/Clash Verge proxy is forced explicitly rather than assumed.
-CHATGPT_PROXY_URL = os.environ.get("THERM_VIBE_HUD_CHATGPT_PROXY", "http://127.0.0.1:7897")
-_proxy_opener = urllib.request.build_opener(
-    urllib.request.ProxyHandler({"http": CHATGPT_PROXY_URL, "https": CHATGPT_PROXY_URL})
+# If the usage endpoint is not reachable directly from your network, set
+# THERM_VIBE_HUD_CHATGPT_PROXY to an HTTP proxy URL — urllib's automatic
+# system-proxy detection (via macOS _scproxy) is not reliably picked up from
+# this daemon's LaunchAgent context, so the proxy must be forced explicitly.
+# Empty default: connect directly.
+CHATGPT_PROXY_URL = os.environ.get("THERM_VIBE_HUD_CHATGPT_PROXY", "")
+_proxy_opener = (
+    urllib.request.build_opener(
+        urllib.request.ProxyHandler(
+            {"http": CHATGPT_PROXY_URL, "https": CHATGPT_PROXY_URL}
+        )
+    )
+    if CHATGPT_PROXY_URL
+    else urllib.request.build_opener()
 )
-# Sustained outages (e.g. GFW DNS poisoning on chatgpt.com) shouldn't hammer
+# Sustained outages shouldn't hammer
 # the endpoint every LAST_KNOWN_QUOTA_TTL_SEC (60s) forever — back off
 # exponentially per consecutive failure, capped, until a fetch succeeds.
 LIVE_QUOTA_BACKOFF_BASE_SEC = 60
