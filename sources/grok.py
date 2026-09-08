@@ -29,6 +29,7 @@ BOT_USAGE_CACHE_SEC = 5
 CLI_USAGE_CACHE_SEC = 5
 REQUEST_TIMEOUT_SEC = 30
 MAX_SESSIONS = 6
+SESSION_IDLE_SEC = 45
 
 _cache_lock = threading.Lock()
 _cli_cache = None
@@ -120,7 +121,10 @@ def _active_sessions(now=None):
                 "pid": pid,
                 "cwd": cwd,
                 "project": _project_label(cwd),
-                "state": "running",
+                # A live PID only proves some process exists (PIDs get
+                # recycled); summary recency is the honest liveness signal —
+                # otherwise a CLI left open overnight shows "running" forever.
+                "state": "running" if now - updated_at <= SESSION_IDLE_SEC else "idle",
                 "updated_at": updated_at,
                 "model": summary.get("current_model_id"),
                 "signals": signals,
@@ -483,12 +487,19 @@ def read_status():
             {"project": "Grok Bot", "state": "running", "updated_at": time.time()},
         )
 
-    active_count = len(cli["active"]) + int(bot["running"])
+    active_count = (
+        sum(1 for session in cli["active"] if session["state"] == "running")
+        + int(bot["running"])
+    )
     billing = cli.get("billing") or {}
     return {
         "tool": "Grok",
         "display_name": "Grok",
-        "state": "running" if active_count else "no session",
+        "state": (
+            "running"
+            if active_count
+            else ("idle" if cli["active"] else "no session")
+        ),
         "identity": cli.get("model"),
         "plan_type": billing.get("plan"),
         "active_count": active_count,

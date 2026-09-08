@@ -1,3 +1,4 @@
+import time
 import unittest
 from unittest import mock
 
@@ -121,6 +122,46 @@ class SixPanelLayoutTests(unittest.TestCase):
         )
         self.assertNotIn("ACCESS", [row[1] for row in rows])
         self.assertNotIn("QUOTA", [row[1] for row in rows])
+
+    def test_codex_usage_rows_drop_dead_cache_hit_when_no_session(self):
+        rows = renderer._usage_metrics({
+            "tool": "Codex",
+            "usage_percent": 0.0,
+            "usage_resets_at": time.time() + 3600,
+            "context_percent": None,
+            "secondary_percent": None,
+            "cache_hit_percent": None,
+        })
+
+        self.assertEqual([row[1] for row in rows], ["RATE LIMIT"])
+        self.assertNotIn("no usage data", rows[0][3])
+
+    def test_grok_cli_quota_caption_marks_stale_snapshots(self):
+        rows = renderer._usage_metrics({
+            "tool": "Grok",
+            "grok_cli_percent": 76.0,
+            "grok_cli_resets_at": time.time() + 4 * 86400,
+            "grok_cli_quota_updated_at": time.time() - 21 * 3600,
+            "grok_bot_percent": 11.7,
+            "grok_bot_resets_at": time.time() + 86400,
+            "context_percent": None,
+            "cache_hit_percent": None,
+        })
+
+        self.assertEqual(rows[0][1], "CLI QUOTA")
+        self.assertIn("21h old", rows[0][3])
+
+        fresh = renderer._usage_metrics({
+            "tool": "Grok",
+            "grok_cli_percent": 76.0,
+            "grok_cli_resets_at": time.time() + 4 * 86400,
+            "grok_cli_quota_updated_at": time.time() - 600,
+            "grok_bot_percent": None,
+            "grok_bot_resets_at": None,
+            "context_percent": None,
+            "cache_hit_percent": None,
+        })
+        self.assertNotIn("old", fresh[0][3])
 
     def test_minimax_unlimited_weekly_uses_infinity_sentinel(self):
         rows = renderer._usage_metrics({

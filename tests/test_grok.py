@@ -1,7 +1,9 @@
 import json
 import os
 import tempfile
+import time
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest import mock
 from urllib.parse import quote
@@ -109,6 +111,33 @@ class GrokStatusTests(unittest.TestCase):
         serialized = json.dumps(status)
         self.assertNotIn(cwd, serialized)
         self.assertNotIn("018f-uuid", serialized)
+
+    def test_stale_cli_session_reports_idle_not_running(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cwd = "/tmp/demo"
+            directory = root / quote(cwd, safe="") / "018f-uuid"
+            directory.mkdir(parents=True)
+            stale_iso = datetime.fromtimestamp(
+                time.time() - 20 * 3600, tz=timezone.utc
+            ).isoformat()
+            (directory / "summary.json").write_text(
+                json.dumps({"updated_at": stale_iso}), encoding="utf-8"
+            )
+            (root / "active_sessions.json").write_text(
+                json.dumps(
+                    [{"pid": os.getpid(), "session_id": "018f-uuid", "cwd": cwd}]
+                ),
+                encoding="utf-8",
+            )
+            with mock.patch.object(
+                grok, "ACTIVE_SESSIONS_PATH", root / "active_sessions.json"
+            ):
+                with mock.patch.object(grok, "SESSIONS_DIR", root):
+                    sessions = grok._active_sessions()
+
+        self.assertEqual(len(sessions), 1)
+        self.assertEqual(sessions[0]["state"], "idle")
 
     def test_bot_usage_parses_percent_plan_and_millisecond_reset(self):
         status_payload = {

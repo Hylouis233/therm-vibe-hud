@@ -609,7 +609,13 @@ def _usage_metrics(status):
             # entirely rather than shown pinned to "no usage data" forever.
             sec_resets = _format_resets(status.get("secondary_resets_at"))
             rows.append(("bar", "WEEKLY", secondary, sec_resets or "", "secondary_percent", status.get("secondary_resets_at")))
-        rows.append(("bar", "CACHE HIT", status.get("cache_hit_percent"), "", "cache_hit_percent", None))
+        cache_hit = status.get("cache_hit_percent")
+        if cache_hit is not None:
+            # Cache-hit % only exists while a local session feeds token
+            # events; with no recent session it is permanently None, and a
+            # dead empty bar reads as broken — drop it, same rationale as
+            # the WEEKLY row above.
+            rows.append(("bar", "CACHE HIT", cache_hit, "", "cache_hit_percent", None))
         return rows
     if tool == "Kimi Code":
         monthly = status.get("kimi_monthly_percent")
@@ -718,13 +724,29 @@ def _usage_metrics(status):
                 f"{_human_count(context_window)} tok"
             )
         bot_resets_at = status.get("grok_bot_resets_at")
+        cli_caption = _format_resets(cli_resets_at) or (
+            "no billing data" if status.get("grok_cli_percent") is None else ""
+        )
+        quota_updated_at = status.get("grok_cli_quota_updated_at")
+        if status.get("grok_cli_percent") is not None and quota_updated_at:
+            # The CLI only appends a billing record while it runs, so the
+            # snapshot can sit untouched long after the account moved on —
+            # mark its age instead of passing stale data off as current.
+            age_sec = time.time() - quota_updated_at
+            if age_sec > 3600:
+                if age_sec >= 48 * 3600:
+                    age_text = f"{int(age_sec // 86400)}d old"
+                else:
+                    age_text = f"{max(1, int(age_sec // 3600))}h old"
+                cli_caption = (
+                    f"{cli_caption} · {age_text}" if cli_caption else age_text
+                )
         return [
             (
                 "bar",
                 "CLI QUOTA",
                 status.get("grok_cli_percent"),
-                _format_resets(cli_resets_at)
-                or ("no billing data" if status.get("grok_cli_percent") is None else ""),
+                cli_caption,
                 "grok_cli_percent",
                 cli_resets_at,
             ),
